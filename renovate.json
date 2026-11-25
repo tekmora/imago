@@ -75,7 +75,8 @@
         "go"
       ],
       "groupName": "go-toolchain",
-      "groupSlug": "go-toolchain"
+      "groupSlug": "go-toolchain",
+      "minimumReleaseAge": "7 days"
     },
     {
       "matchDatasources": [

@@ -64,6 +64,10 @@ test-python:
   - *workflows
   - '.github/requirements/**'
   - 'CHANGELOG.md'
+  - 'renovate.json'
+  - '.needs.yaml'
+  - 'go.mod'
+  - 'tools/govulncheck/go.mod'
 docs-strict:
   - *docs
   - *workflows
@@ -73,6 +77,8 @@ semgrep: &scan-code
   - 'packer/**'
   - 'tests/**'
   - 'versions.json'
+  - 'renovate.json'
+  - '.needs.yaml'
   - 'Makefile'
   - 'pyproject.toml'
   - 'go.mod'

@@ -256,3 +256,25 @@ def test_test_python_filter_matches_required_inputs(path: str) -> None:
     """Run Python tests for SAST pins (#204) and changelog exceptions (#278)."""
     patterns = [glob_regex(p) for p in flatten(filters()["test-python"])]
     assert any(regex.match(path) for regex in patterns), f"test-python: {path} not in its filter"
+
+
+def _assert_literal_filter_paths(job_id: str, patterns: list, paths: set[str]) -> None:
+    missing = paths - set(flatten(patterns))
+    assert not missing, f"{job_id} filter is missing literal paths: {sorted(missing)}"
+
+
+@pytest.mark.parametrize(
+    ("job_id", "paths"),
+    [
+        ("test-python", {"renovate.json", ".needs.yaml", "go.mod", "tools/govulncheck/go.mod"}),
+        ("semgrep", {"renovate.json", ".needs.yaml"}),
+    ],
+)
+def test_renovate_inputs_run_their_checks(job_id: str, paths: set[str]) -> None:
+    _assert_literal_filter_paths(job_id, filters()[job_id], paths)
+
+
+def test_semgrep_filter_refuses_missing_renovate_path() -> None:
+    patterns = [path for path in flatten(filters()["semgrep"]) if path != "renovate.json"]
+    with pytest.raises(AssertionError, match=r"semgrep filter is missing literal paths: \['renovate\.json'\]"):
+        _assert_literal_filter_paths("semgrep", patterns, {"renovate.json", ".needs.yaml"})

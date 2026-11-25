@@ -147,7 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-adoption wrote no exception and changed no other file.
 - The Praetor engine pin moves from `4ae6247c` to `6622361940dc` (`PRAETOR_REF` in
   `.github/workflows/ci.yml`). The new engine's audit refused the earlier texts of
-  `tools/markdownlint/verify.mjs`, `tools/markdownlint/no-private-scratch-links.mjs` and
+  the docs-lint verifier, its private-scratch-link rule and
   `tools/figures/checks.mjs`, and `praetorctl adopt` refreshed them together with
   `.config/agent/hooks/block_evasion.py`; no other adopted file changes. The refreshed
   interceptor chains its exception, so its `ruff.toml` lint line lists no rule (it was
@@ -173,7 +173,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before a commit and the full audit and gate before a push, and the declared branch
   rule set for `main` requires signed commits and nine status checks.
 - A documentation gate is part of `make verify-all` and of CI (`Documentation Governance`):
-  `make docs-lint` checks every tracked Markdown file with the pinned markdownlint
+  `make docs-lint` checks every tracked Markdown file with the pinned linter
   configuration, and `make docs-figures` checks the rendered figures. The existing
   Markdown files were brought into line with it.
 - The managed-agent manifests moved from `.agents/agents/` to `.agents/managed-agents/`;
@@ -193,8 +193,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ever tagged or published, so the release manifest is empty and `initial-version`
   states the first one. Version 1.0.0 waits until the milestone `1.0 — First release` is
   closed; a governance test refuses `initial-version`, the manifest entry or `VERSION`
-  from 1.0.0 up while it is open. The release pull request moves to a branch named after the new
-  package.
+  from 1.0.0 up while it is open. The package rename also changed the configured release branch name.
 - Every workflow action that ran on the Node 20 runtime is pinned to its current release,
   which runs on Node 24: `checkout` v7.0.1, `setup-go` v7.0.0, `setup-python` v7.0.0,
   `upload-artifact` v7.0.2, `deploy-pages` v5.0.1, the four `codeql-action` steps v4.38.3,
@@ -238,10 +237,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Raised Go to 1.27.4 for GO-2026-6859 (`net/http`). Renovate now proposes updates to both `go` directives and `.needs.yaml` in one pull request and waits seven days after a Go release before opening it.
-- The pre-commit markdownlint hook covers `CHANGELOG.md` again. The duplicate Unreleased subsections are merged, and the released heading carries a dated category C MD024 exception. `tests/test_changelog_lint_exceptions.py` fails once the exception expires (#278).
-- Expired exceptions that turned `main` red: the pin exceptions for `CUDA_LEGACY`, `CUDA_MAINSTREAM` and `ROCM_LEGACY_VERSION` in `tests/test_version_pins_consumed.py` lapsed on 2026-11-08 and failed the Pytest suite on every branch. `33-gpu-nvidia-legacy.sh` and `34-gpu-nvidia-mainstream.sh` now require their CUDA label and print it in the build log, as the modern and bleeding scripts already do. `ROCM_LEGACY_VERSION` is no longer passed to the build because no flavor installs it; `versions.json` keeps the pin for the upstream check (`docs/hardware/amd.md`). The codespell exception for the minified `tools/figures/player/player.js` bundle in `.standards.yaml` lapsed on 2026-11-04 and failed `praetorctl audit`; it is renewed as category C until 2026-12-05.
-- Path filter for `test-python` now includes `.github/requirements/**` so changes to SAST locks or overrides run the Pytest verification suite and governance override floor checks (#204).
+- Raised Go to 1.27.4 for GO-2026-6859 (`net/http`). Renovate groups both `go` directives and the `.needs.yaml` pin in one pull request, with a seven-day minimum release age on all three pins.
+- The pre-commit Markdown linter covers `CHANGELOG.md` again. The duplicate Unreleased subsections are merged, and the released heading carries a dated category C MD024 exception. `tests/test_changelog_lint_exceptions.py` fails once the exception expires (#278), refuses every mention of the linter's directive keyword outside a standalone next-line directive, and requires category A reasons to begin with the interval clause.
+- Expired exceptions that turned `main` red: the pin exceptions for `CUDA_LEGACY`, `CUDA_MAINSTREAM` and `ROCM_LEGACY_VERSION` in `tests/test_version_pins_consumed.py` lapsed on 2026-11-08 and failed the Pytest suite on every branch. The pin reader now parses each provisioner script with shfmt. `33-gpu-nvidia-legacy.sh` and `34-gpu-nvidia-mainstream.sh` now require their CUDA label and print it in the build log, as the modern and bleeding scripts already do. `ROCM_LEGACY_VERSION` is no longer passed to the build because no flavor installs it; `versions.json` keeps the pin for the upstream check (`docs/hardware/amd.md`). The codespell exception for the minified `tools/figures/player/player.js` bundle in `.standards.yaml` lapsed on 2026-11-04 and failed `praetorctl audit`; it is renewed as category C until 2026-12-05.
+- Path filter for `test-python` now includes `.github/requirements/**` so changes to SAST locks or overrides run the Pytest verification suite and governance override floor checks (#204). Changes to `renovate.json` now trigger both the Python test and Semgrep jobs.
 - SAST lock after the opentelemetry-api security update (#204): the re-lock had resolved semgrep down to 1.79.0 and dropped `mcp==1.30.0`, which turned the override-floor test red on `main`. `sast-overrides.txt` now moves the OpenTelemetry release set to 1.45.1 / 0.66b1 (GHSA-xcq7-p3pf-p88h; the API cannot move alone, the 1.37.0 exporters fail to import against it), and `sast.txt` is recompiled from the previous lock with semgrep 1.180.0 kept. `tests/test_governance.py` holds the new floor; the scanner canary passes against the new lock and fails against an API-only override.
 - Metadata gate refused PR bodies longer than the pipe buffer (SIGPIPE under pipefail), now reads via here-string (#200).
 - Go toolchain raised to 1.27.3 for GO-2026-6809 / CVE-2026-111943 (crypto/x509 distrusts compromised intermediate certificates; fixed in 1.27.3): the `go` directive in `go.mod` and `tools/govulncheck/go.mod` and `go_version` in `.needs.yaml` carry 1.27.3, and the four workflows that pinned `1.27.x` read the version from `go.mod` with `go-version-file`, as `aegis-build.yml` already did, so `go.mod` is the one source.
@@ -266,7 +265,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aegis build workflow: mkosi now builds with `--tools-tree=yes --tools-tree-distribution=arch`, because the first dispatch (run 39067484406) failed on the hosted runner without `systemd-repart`; the Arch tools tree carries repart, ukify and the erofs, btrfs and vfat tools and follows the image snapshot (`docs/adr/0033-aegis-build-workflow.md`).
 - The kernel forge blueprint no longer claims a UKI release asset (issue #49): `docs/operations/sister-repo-kernel-forge-blueprint.md` lists the assets `publish-release.yml` uploads at `cordanaLLM/nucleus` commit `bcb5ebf` (the `.deb` packages, `vmlinuz`, the kconfig, both SBOMs, `SHA256SUMS`, its bundle and the manifest) and marks the UKI `.efi`, debug symbols, the APT repository and the OCI registry as planned.
 - `planning/routing.json` contradicted the forge (ADR-0029, amends ADR-0025). `step-nucleus-contract` read done although no nucleus release had crossed the contract (#47), and `step-lefthook-verify` and `step-app-hardening` read open after #80 and #81 closed. The nucleus step is reopened and carried by #47, the other two are done with their pull requests as evidence, and `tests/test_planning_overlay.py` fails when the overlay and the table of carried steps in `docs/tools/planning-graph.md` name different open steps.
-- release-please can no longer lose its pull request capability unnoticed (issue #45): `.standards.yaml` declares `overrides.actions` (default token permission `read`, `allow_create_and_approve_pull_requests: true`), and the online `praetorctl audit` fails when the forge setting differs, naming whether the repository or the organisation changed it. A planted `false` declaration fails the audit with `drifted-by-organisation`; the declared value passes.
+- The workflow permission drift check (issue #45) compares the forge settings with `.standards.yaml`, which declares default token permission `read` and `allow_create_and_approve_pull_requests: false` under `overrides.actions`. The online `praetorctl audit` fails on a mismatch and names the affected repository or organisation.
 - Hindsight MCP bridge sends the tenant key (issue #36): `scripts/hindsight_mcp_server.py` reads `HINDSIGHT_API_KEY` and sends it as `Authorization: Bearer <key>` on every request; `.mcp.json` and `.agents/mcp_config.json` declare it as `${HINDSIGHT_API_KEY:-}`. `hindsight_status` reports `UNREACHABLE`, `UNAUTHORISED` (naming the variable) and `ERROR` instead of always blaming the port-forward. The offline buffer drains on the first successful call of any tool, each fact into its own bank (before, only a successful retain flushed, into the bank of that retain), and stops at the first refusal.
 - `.github/milestones.json` follows the forge again after the milestones were renamed to `X.Y.Z — Title` (`0.1.0 — First release`, `0.2.0` to `0.4.0`, `Backlog — Roadmap after the first release` and two `Ongoing` milestones); the daily `milestone-drift` run had failed on 12 differences since 2026-10-16. `tests/test_governance.py` reads the first version from the milestone titled `X.Y.Z — First release`, refuses a title without a full version, and refuses any release version past it while the milestone is open.
 

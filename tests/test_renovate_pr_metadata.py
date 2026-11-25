@@ -183,6 +183,74 @@ def test_renovate_pr_metadata():
     assert label_gate_regex.search(json.dumps(labels)) is not None
 
 
+def _matches_literal_patterns(value: str | None, patterns: list[str]) -> bool:
+    """Model the case-insensitive literals and literal negation used by this config."""
+    assert all(re.fullmatch(r"!?[A-Za-z0-9_.-][A-Za-z0-9_./-]*", pattern) for pattern in patterns), (
+        f"unsupported Renovate match pattern: {patterns!r}"
+    )
+    if value is None or not patterns:
+        return False
+    positive = {pattern.lower() for pattern in patterns if not pattern.startswith("!")}
+    negative = {pattern[1:].lower() for pattern in patterns if pattern.startswith("!")}
+    value = value.lower()
+    return value not in negative and (not positive or value in positive)
+
+
+def _resolve_package_rules(
+    rules: list[dict[str, Any]],
+    *,
+    manager: str,
+    dep_name: str,
+    dep_type: str | None,
+    datasource: str,
+    file: str,
+) -> dict[str, Any]:
+    match_values = {
+        "matchManagers": manager,
+        "matchDepNames": dep_name,
+        "matchDepTypes": dep_type,
+        "matchDatasources": datasource,
+        "matchFileNames": file,
+    }
+    resolved: dict[str, Any] = {}
+    for index, rule in enumerate(rules):
+        matchers = {key for key in rule if key.startswith("match")}
+        unknown = matchers - match_values.keys()
+        assert not unknown, f"packageRules[{index}] has unsupported matchers: {sorted(unknown)}"
+        matches = [_matches_literal_patterns(match_values[key], rule[key]) for key in matchers]
+        if all(matches):
+            resolved.update({key: value for key, value in rule.items() if key not in matchers})
+    return resolved
+
+
+def _needs_go_manager(config: dict[str, Any]) -> dict[str, Any]:
+    managers = [
+        manager
+        for manager in config["customManagers"]
+        if manager.get("customType") == "regex"
+        and any(re.search(pattern[1:-1], ".needs.yaml") for pattern in manager["managerFilePatterns"])
+    ]
+    assert len(managers) == 1, "One regex manager must track the .needs.yaml Go pin"
+    return managers[0]
+
+
+def _assert_go_toolchain_rule(file: str, settings: dict[str, Any]) -> None:
+    assert settings.get("groupSlug") == "go-toolchain", f"{file} must resolve to the go-toolchain group"
+    assert settings.get("groupName") == "go-toolchain", f"{file} must resolve to the go-toolchain group name"
+    assert settings.get("minimumReleaseAge") == "7 days", f"{file} must resolve to minimumReleaseAge of 7 days"
+
+
+def _needs_go_settings(config: dict[str, Any], manager: dict[str, Any]) -> dict[str, Any]:
+    return _resolve_package_rules(
+        config["packageRules"],
+        manager=f"custom.{manager['customType']}",
+        dep_name=manager["depNameTemplate"],
+        dep_type=manager.get("depTypeTemplate"),
+        datasource=manager["datasourceTemplate"],
+        file=".needs.yaml",
+    )
+
+
 def test_renovate_updates_go_pins_together() -> None:
     config = load_renovate_config()
     rules = config["packageRules"]
@@ -205,16 +273,9 @@ def test_renovate_updates_go_pins_together() -> None:
     )
 
     needs = ROOT / ".needs.yaml"
-    managers = [
-        manager
-        for manager in config["customManagers"]
-        if manager.get("customType") == "regex"
-        and manager.get("depNameTemplate") == "go"
-        and manager.get("datasourceTemplate") == "golang-version"
-    ]
-    assert len(managers) == 1, "One regex manager must track the .needs.yaml Go pin"
-    manager = managers[0]
-    assert any(re.search(pattern[1:-1], needs.name) for pattern in manager["managerFilePatterns"])
+    manager = _needs_go_manager(config)
+    assert manager["depNameTemplate"] == "go"
+    assert manager["datasourceTemplate"] == "golang-version"
     content = needs.read_text(encoding="utf-8")
     pins = [
         match["currentValue"]
@@ -222,10 +283,48 @@ def test_renovate_updates_go_pins_together() -> None:
         for match in re.finditer(pattern.replace("(?<", "(?P<"), content)
     ]
     assert len(pins) == 1, "The regex manager must capture the real go_version line"
-    for path in (ROOT / "go.mod", ROOT / "tools/govulncheck/go.mod"):
-        directive = re.search(r"^go (\S+)$", path.read_text(encoding="utf-8"), re.MULTILINE)
+    for file in ("go.mod", "tools/govulncheck/go.mod"):
+        directive = re.search(r"^go (\S+)$", (ROOT / file).read_text(encoding="utf-8"), re.MULTILINE)
         assert directive is not None
-        assert pins[0] == directive[1], f"{path.relative_to(ROOT)} must match the .needs.yaml Go pin"
+        assert pins[0] == directive[1], f"{file} must match the .needs.yaml Go pin"
+        settings = _resolve_package_rules(
+            rules, manager="gomod", dep_name="go", dep_type="golang", datasource="golang-version", file=file
+        )
+        _assert_go_toolchain_rule(file, settings)
+    _assert_go_toolchain_rule(".needs.yaml", _needs_go_settings(config, manager))
+
+
+def test_needs_go_pin_requires_the_group_release_age() -> None:
+    config = load_renovate_config()
+    (group,) = [rule for rule in config["packageRules"] if rule.get("groupSlug") == "go-toolchain"]
+    group.pop("minimumReleaseAge", None)
+    with pytest.raises(AssertionError, match=r"\.needs\.yaml must resolve to minimumReleaseAge of 7 days"):
+        _assert_go_toolchain_rule(".needs.yaml", _needs_go_settings(config, _needs_go_manager(config)))
+
+
+def test_package_rule_resolver_refuses_unknown_matchers() -> None:
+    with pytest.raises(AssertionError, match=r"unsupported matchers: \['matchPackageNames'\]"):
+        _resolve_package_rules(
+            [{"matchManagers": ["gomod"], "matchPackageNames": ["go"], "minimumReleaseAge": "7 days"}],
+            manager="custom.regex",
+            dep_name="go",
+            dep_type=None,
+            datasource="golang-version",
+            file=".needs.yaml",
+        )
+
+
+def test_package_rule_resolver_applies_matching_rules_in_order() -> None:
+    rules = [
+        {"matchManagers": ["custom.regex"], "minimumReleaseAge": "3 days", "groupSlug": "example"},
+        {"matchDepNames": ["!go"], "groupSlug": "wrong-group"},
+        {"matchDepTypes": ["!golang"], "groupSlug": "unset-dep-type-is-not-a-match"},
+        {"matchDatasources": ["golang-version"], "matchFileNames": [".needs.yaml"], "minimumReleaseAge": "7 days"},
+        {"matchFileNames": ["go.mod"], "minimumReleaseAge": "10 days"},
+    ]
+    assert _resolve_package_rules(
+        rules, manager="custom.regex", dep_name="GO", dep_type=None, datasource="golang-version", file=".needs.yaml"
+    ) == {"minimumReleaseAge": "7 days", "groupSlug": "example"}
 
 
 def test_checker_refuses_unpatched_config():

@@ -7,9 +7,14 @@ explicit, unexpired exception entry in EXCEPTIONS.
 Also verifies build wiring for stargz-snapshotter (51) and enroot (62).
 """
 
+import json
 import re
+import shutil
+import subprocess
 from datetime import date
+from functools import cache
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,31 +32,9 @@ ENROOT_TARGETS = {
     "ai-infer-nvidia-bleeding",
 }
 
-_NAME = r"[A-Za-z_](?:(?:\\\n)*[A-Za-z_0-9])*"
-_PARAMETER = rf"\$(?:\\\n)*(?:\{{(?:\\\n)*(?:[#!](?:\\\n)*)?)?(?P<parameter>{_NAME})"
-_EXPANSION = re.compile(rf"\\.|(?P<arithmetic>\$\(\()|{_PARAMETER}", re.DOTALL)
-_ARITHMETIC_TOKEN = re.compile(
-    rf"\\.|{_PARAMETER}|(?P<bare>{_NAME})(?P<assignment>[ \t]*=(?!=))?|[0-9][A-Za-z_0-9#@]*|[()]",
-    re.DOTALL,
-)
-_DELIMITER_PART = r"""'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s'"\\;&|()<>]+"""
-_DELIMITER_PARTS = re.compile(_DELIMITER_PART, re.DOTALL)
-_DOUBLE_QUOTED_ESCAPE = re.compile(r'\\([$`"\\\n])')
-_SHELL_TOKEN = re.compile(
-    rf"""
-    (?P<newline>\n)
-    | (?P<hash>\#)
-    | (?P<arithmetic>\$?\(\()
-    | (?<!<)<<(?P<tabs>-?)[ \t]*(?P<delimiter>(?:{_DELIMITER_PART})++)(?=[\s;&|()<>]|$)
-    | \$'(?:\\.|[^'\\])*' | '[^']*'
-    | (?P<quoted>"(?:\\.|[^"\\])*")
-    | {_PARAMETER}
-    | (?P<continuation>\\\n) | \\.
-    | (?P<boundary>[ \t;&|()<>])
-    | [^\s'"\\$\#;&|()<>]+ | .
-    """,
-    re.DOTALL | re.VERBOSE,
-)
+_ARITHMETIC_ROOTS = {"ArithmExp", "ArithmCmd"}
+_ARITHMETIC_NODES = {"BinaryArithm", "UnaryArithm", "ParenArithm"}
+_ARITHMETIC_TESTS = {"-eq", "-ne", "-lt", "-le", "-gt", "-ge"}
 
 
 def get_common_env_names() -> list[str]:
@@ -66,117 +49,78 @@ def get_common_env_names() -> list[str]:
     return names
 
 
-def get_all_provisioner_content() -> str:
-    scripts = sorted(PROVISIONERS_DIR.glob("*.sh"))
-    return "\n".join(s.read_text(encoding="utf-8") for s in scripts)
+def _parse_script(content: str, filename: str) -> dict[str, Any]:
+    shfmt = shutil.which("shfmt")
+    if shfmt is None:
+        pytest.fail("shfmt is missing from PATH; install shfmt-py from .github/requirements/test.txt")
+    result = subprocess.run(
+        [shfmt, "--to-json", "-ln", "bash"], input=content, capture_output=True, text=True, check=False, timeout=30
+    )
+    if result.returncode != 0:
+        pytest.fail(f"shfmt could not parse {filename}: {result.stderr.strip()}")
+    return json.loads(result.stdout)
 
 
-def _arithmetic_read(name: str, text: str, start: int) -> tuple[int, bool]:
-    depth = 2
-    reads = False
-    for token in _ARITHMETIC_TOKEN.finditer(text, start):
-        if token[0] == "(":
-            depth += 1
-        elif token[0] == ")":
-            depth -= 1
-            if depth == 0:
-                return token.end(), reads
-        else:
-            variable = token["parameter"] or (token["bare"] if token["assignment"] is None else None)
-            if variable and variable.replace("\\\n", "") == name:
-                reads = True
-    return start, False
+def _quoted_heredoc(node: dict[str, Any]) -> bool:
+    # shfmt 3.14.1 can emit expansions in the body of a partly quoted <<- heredoc.
+    return node.get("Op") in {"<<", "<<-"} and any(
+        part["Type"] != "Lit" or "\\" in part["Value"] for part in node["Word"]["Parts"]
+    )
 
 
-def _expansion_reads(name: str, text: str) -> bool:
-    position = 0
-    for _ in range(len(text)):
-        token = _EXPANSION.search(text, position)
-        if token is None:
-            break
-        position = token.end()
-        if token["arithmetic"]:
-            position, reads = _arithmetic_read(name, text, position)
-            if reads:
-                return True
-        elif token["parameter"] and token["parameter"].replace("\\\n", "") == name:
-            return True
-    return False
-
-
-def _heredoc(word: str, strip_tabs: bool) -> tuple[re.Pattern[str], bool]:
-    parts = []
-    expands = True
-    for match in _DELIMITER_PARTS.finditer(word):
-        part = match[0]
-        if part == "\\\n":
+def _ast_children(
+    node: dict[str, Any], arithmetic: bool, write: bool
+) -> list[tuple[dict[str, Any] | list, bool, bool]]:
+    kind = node.get("Type")
+    operator = node.get("Op")
+    children = []
+    for field, child in node.items():
+        if field == "Hdoc" and _quoted_heredoc(node):
             continue
-        if part.startswith('"'):
-            part = _DOUBLE_QUOTED_ESCAPE.sub(lambda escape: escape[1].removesuffix("\n"), part[1:-1])
-        elif part.startswith("'"):
-            part = part[1:-1]
-        elif part.startswith("\\"):
-            part = part[1:]
-        else:
-            parts.append(part)
+        if not isinstance(child, (dict, list)):
             continue
-        expands = False
-        parts.append(part)
-    tabs = r"\t*" if strip_tabs else ""
-    terminator = re.compile(rf"^{tabs}{re.escape(''.join(parts))}$", re.MULTILINE)
-    return terminator, expands
+        # Arithmetic context follows expression edges, never into embedded shell commands.
+        child_arithmetic = (
+            (field == "X" and kind in _ARITHMETIC_ROOTS)
+            or (arithmetic and kind in _ARITHMETIC_NODES and field in {"X", "Y"})
+            or (kind == "BinaryTest" and operator in _ARITHMETIC_TESTS and field in {"X", "Y"})
+            or (arithmetic and (kind, field) in {("Word", "Parts"), ("ParamExp", "Index")})
+        )
+        child_write = (kind == "BinaryArithm" and operator == "=" and field == "X") or (
+            write and kind == "Word" and field == "Parts"
+        )
+        children.append((child, child_arithmetic, child_write))
+    return children
 
 
-def _read_heredocs(
-    name: str, text: str, position: int, heredocs: list[tuple[re.Pattern[str], bool]]
-) -> tuple[int, bool]:
-    # Bash reads pending heredocs in redirect order once the command line ends.
-    for terminator, expands in heredocs:
-        end = terminator.search(text, position)
-        assert end is not None, f"Missing heredoc terminator {terminator.pattern}"
-        if expands and _expansion_reads(name, text[position : end.start()]):
-            return end.end(), True
-        position = end.end()
-    return position, False
-
-
-def _token_reads(name: str, token: re.Match[str]) -> bool:
-    if token["quoted"]:
-        return _expansion_reads(name, token["quoted"][1:-1])
-    return bool(token["parameter"] and token["parameter"].replace("\\\n", "") == name)
-
-
-def is_pin_read_by_provisioners(name: str, provisioner_content: str) -> bool:
-    """Find an exact pin expansion in shell text, including multiline strings and heredocs."""
-    position = 0
-    at_word_start = True
-    heredocs: list[tuple[re.Pattern[str], bool]] = []
-    for _ in range(len(provisioner_content)):
-        token = _SHELL_TOKEN.match(provisioner_content, position)
-        if token is None:
-            break
-        position = token.end()
-        if token["continuation"]:
+def _pins_read(content: str, filename: str) -> set[str]:
+    """Collect direct parameter and bare arithmetic reads from shfmt's typed Bash tree."""
+    pending: list[tuple[dict[str, Any] | list, bool, bool]] = [(_parse_script(content, filename), False, False)]
+    reads: set[str] = set()
+    while pending:
+        node, arithmetic, write = pending.pop()
+        if isinstance(node, list):
+            pending.extend((child, arithmetic, write) for child in node if isinstance(child, (dict, list)))
             continue
-        if token["hash"] and at_word_start:
-            position = provisioner_content.find("\n", position)
-            if position == -1:
-                break
-            continue
-        reads = False
-        if token["arithmetic"]:
-            position, reads = _arithmetic_read(name, provisioner_content, position)
-        elif token["delimiter"]:
-            heredocs.append(_heredoc(token["delimiter"], bool(token["tabs"])))
-        elif token["newline"]:
-            position, reads = _read_heredocs(name, provisioner_content, position, heredocs)
-            heredocs.clear()
-        else:
-            reads = _token_reads(name, token)
-        if reads:
-            return True
-        at_word_start = bool(token["boundary"] or token["newline"])
-    return False
+        kind = node.get("Type")
+        # shfmt models a bare indexed assignment target as a ParamExp without Dollar.
+        if kind == "ParamExp" and "Names" not in node and (not write or "Dollar" in node):
+            reads.add(node["Param"]["Value"])
+        if kind == "Word" and arithmetic and not write:
+            parts = node["Parts"]
+            if len(parts) == 1 and parts[0]["Type"] == "Lit":
+                reads.add(parts[0]["Value"])
+        pending.extend(_ast_children(node, arithmetic, write))
+    return reads
+
+
+@cache
+def _provisioner_reads(path: Path) -> set[str]:
+    return _pins_read(path.read_text(encoding="utf-8"), path.name)
+
+
+def _all_provisioner_reads() -> set[str]:
+    return set().union(*(_provisioner_reads(path) for path in sorted(PROVISIONERS_DIR.glob("*.sh"))))
 
 
 class TestVersionPinsConsumed:
@@ -186,12 +130,7 @@ class TestVersionPinsConsumed:
             'CUDA_VER="${CUDA_LEGACY:?}"\necho "$ROCM_VERSION"\n# ROCM_LEGACY_VERSION is gone\n'
             '  # echo "$CUDA_MAINSTREAM"\n'
         )
-        assert is_pin_read_by_provisioners("CUDA_LEGACY", content)
-        assert is_pin_read_by_provisioners("ROCM_VERSION", content)
-        assert not is_pin_read_by_provisioners("ROCM_LEGACY_VERSION", content)
-        assert not is_pin_read_by_provisioners("CUDA_MAINSTREAM", content)
-        assert not is_pin_read_by_provisioners("CUDA_LEGACY_EXTRA", content)
-        assert not is_pin_read_by_provisioners("CUDA", content)
+        assert _pins_read(content, "basic.sh") == {"CUDA_LEGACY", "ROCM_VERSION"}
 
         multiline = (
             'echo "labels:\n  # cuda $QUOTED_PIN\n"\n'
@@ -201,19 +140,7 @@ class TestVersionPinsConsumed:
             "cat <<'EOF'\nliteral $QUOTED_HEREDOC_PIN\nEOF\n"
             "printf '%s' '$SINGLE_QUOTED_PIN' \"\\$ESCAPED_PIN\"\n"
         )
-        candidates = [
-            "QUOTED_PIN",
-            "HEREDOC_PIN",
-            "COMMENTED_PIN",
-            "INLINE_COMMENT_PIN",
-            "QUOTED_HEREDOC_PIN",
-            "SINGLE_QUOTED_PIN",
-            "ESCAPED_PIN",
-        ]
-        assert [name for name in candidates if is_pin_read_by_provisioners(name, multiline)] == [
-            "QUOTED_PIN",
-            "HEREDOC_PIN",
-        ]
+        assert _pins_read(multiline, "multiline.sh") == {"QUOTED_PIN", "HEREDOC_PIN"}
 
     @pytest.mark.parametrize(
         ("content", "read", "unread"),
@@ -234,18 +161,54 @@ class TestVersionPinsConsumed:
             pytest.param("echo word\\\n#$PIN # $COMMENT", ("PIN",), ("COMMENT",), id="continued-word"),
             pytest.param('echo "$PI\\\nN"', ("PIN",), ("PI",), id="continued-parameter"),
             pytest.param("echo word \\\n# $PIN", (), ("PIN",), id="continued-before-comment"),
+            pytest.param('echo "${!PIN*}"', (), ("PIN",), id="prefix-names-star"),
+            pytest.param('echo "${!PIN@}"', (), ("PIN",), id="prefix-names-at"),
+            pytest.param('echo "${!PIN}"', ("PIN",), (), id="indirect-read"),
+            pytest.param("(( PIN = 1 ))", (), ("PIN",), id="plain-assignment"),
+            pytest.param("(( PIN += 1 ))", ("PIN",), (), id="compound-assignment"),
+            pytest.param("(( PIN <<= 1 ))", ("PIN",), (), id="compound-shift-assignment"),
+            pytest.param("(( PIN[INDEX] = VALUE ))", ("INDEX", "VALUE"), ("PIN",), id="indexed-assignment"),
+            pytest.param("[[ PIN -gt 1 ]]", ("PIN",), (), id="arithmetic-test"),
+            pytest.param("[[ -v PIN ]]", (), ("PIN",), id="variable-existence-test"),
+            pytest.param("declare -n alias=PIN", (), ("PIN",), id="nameref"),
+            pytest.param("(( n = $(echo PIN) ))", (), ("PIN", "n"), id="plain-word-inside-arithmetic-substitution"),
+            pytest.param(
+                "cat <<$'EOF'\n${PIN}\nEOF\necho \"$IMG_PAUSE\"",
+                ("IMG_PAUSE",),
+                ("PIN",),
+                id="ansi-c-quoted-heredoc",
+            ),
+            pytest.param(
+                "cat <<EOF-CONFIG\ncuda: '$CUDA_LEGACY'\nEOF-CONFIG",
+                ("CUDA_LEGACY",),
+                (),
+                id="quotes-inside-unquoted-heredoc",
+            ),
         ],
     )
     def test_pin_reader_detection(self, content: str, read: tuple[str, ...], unread: tuple[str, ...]) -> None:
-        for name in read:
-            assert is_pin_read_by_provisioners(name, content), f"missed read of {name}"
-        for name in unread:
-            assert not is_pin_read_by_provisioners(name, content), f"unexpected read of {name}"
+        reads = _pins_read(content, "detection.sh")
+        assert set(read) <= reads, f"missed reads of {set(read) - reads}"
+        assert not (unexpected := set(unread) & reads), f"unexpected reads of {unexpected}"
+
+    def test_pin_reader_reports_shfmt_parse_failure(self, tmp_path: Path) -> None:
+        script = tmp_path / "broken-provisioner.sh"
+        script.write_text('echo "$PIN"\nif then\n', encoding="utf-8")
+        with pytest.raises(pytest.fail.Exception, match=r"shfmt could not parse broken-provisioner\.sh: 2:\d+: .+"):
+            _provisioner_reads(script)
+
+    def test_pin_reader_reports_missing_shfmt(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("PATH", str(tmp_path))
+        with pytest.raises(
+            (pytest.fail.Exception, pytest.skip.Exception), match=r"shfmt-py from \.github/requirements/test\.txt"
+        ) as outcome:
+            _pins_read('echo "$PIN"', "missing-shfmt.sh")
+        assert isinstance(outcome.value, pytest.fail.Exception), "Missing shfmt must fail the check"
 
     def test_exceptions_validity(self) -> None:
         """Verify exceptions: unexpired, present in common_env, and not consumed (no stale entry)."""
         common_env_names = get_common_env_names()
-        provisioner_content = get_all_provisioner_content()
+        reads = _all_provisioner_reads()
         today = date.today()
 
         for name, entry in EXCEPTIONS.items():
@@ -254,20 +217,20 @@ class TestVersionPinsConsumed:
             assert name in common_env_names, (
                 f"Excepted pin '{name}' is not defined in local.common_env of builds.pkr.hcl"
             )
-            assert not is_pin_read_by_provisioners(name, provisioner_content), (
+            assert name not in reads, (
                 f"Excepted pin '{name}' is now read by provisioners; stale exception must be removed"
             )
 
     def test_all_common_env_pins_consumed(self) -> None:
         """Verify every common_env pin is consumed by at least one provisioner script or excepted."""
         common_env_names = get_common_env_names()
-        provisioner_content = get_all_provisioner_content()
+        reads = _all_provisioner_reads()
 
         unconsumed: list[str] = []
         for name in common_env_names:
             if name in EXCEPTIONS:
                 continue
-            if not is_pin_read_by_provisioners(name, provisioner_content):
+            if name not in reads:
                 unconsumed.append(name)
 
         assert not unconsumed, (

@@ -44,12 +44,13 @@ The monthly cadence is overseen by release maintainers following standard SOPs:
 ### 3.1 Tasks & Procedures
 
 1. **Release Milestone Cut**:
-   - The `release-please` workflow runs on `main`. Opening the release pull request
-     requires the release app migration tracked in issue #256 because the workflow token
-     lacks that permission. After the migration, review the pull request with the next
-     `CHANGELOG.md` section, the `VERSION` file and the version constant in `cmd/imago/main.go`.
-   - Merge that pull request to publish. The next run of the `release-please` workflow tags the merge
-     commit `vX.Y.Z` and creates the GitHub release. The first release is `v0.1.0`
+   - The `release-please` workflow is configured for pushes to `main`. Opening a new release
+     pull request waits for the release app migration tracked in issue #256. Until then,
+     open pull request #58 (`chore(main): release 0.1.0`) is the release pull request to
+     review and merge once the `0.1.0 — First release` milestone is complete.
+   - Review the next `CHANGELOG.md` section, the `VERSION` file and the version constant
+     in `cmd/imago/main.go` before merging. After merging, verify that the `release-please`
+     workflow tagged the merge commit `vX.Y.Z` and created the GitHub release. The first release is `v0.1.0`
      (`initial-version` in `release-please-config.json`), the version the milestone
      `0.1.0 — First release` names; `tests/test_governance.py` refuses any later version
      while that milestone is open. Later versions follow from the

@@ -41,7 +41,7 @@ Across the reference repositories, the stable architectural pattern is:
 | **Trunk-Based PR Merge Flow** | **Adopted** | Protected `main`, branch protection requiring `required-checks`, squash/rebase only |
 | **Pinned GitHub Actions** | **Adopted** | All 26 actions in `.github/workflows/` pinned to 40-character commit SHAs |
 | **Conventional Commits** | **Adopted** | `type(scope): subject` syntax enforced via PR titles and release automation |
-| **Semantic Versioning (Release Please)** | **Adopted** | Automated releases, CHANGELOG generation, and release pull requests |
+| **Semantic Versioning (Release Please)** | **Adopted** | `release-please` is configured. Opening a new release pull request waits for issue #256. |
 | **Append-Only ADRs** | **Adopted** | [`docs/adr/`](adr/README.md) following standardized format |
 | **Material for MkDocs Portal** | **Adopted** | `mkdocs build --strict` deploying to GitHub Pages via [`pages.yml`](https://github.com/cordanaLLM/imago/blob/main/.github/workflows/pages.yml) |
 | **Privacy & Zero-Leak Invariant** | **Adopted** | Strict prohibition on RFC 1918 IPs and `/home/*` paths (`test_no_private_ips_or_user_paths`) |
@@ -60,8 +60,11 @@ Across the reference repositories, the stable architectural pattern is:
 
 Place `<!-- lint-exception: rule MD024, category A, entered YYYY-MM-DD, expires YYYY-MM-DD, issue 123: reason -->`
 immediately above the standalone `markdownlint-disable-next-line` directive and use the same rule list in both.
-For category A, state `interval <N> days` or `interval to <YYYY-MM-DD>` in the reason. The expiry must be on or
-before the entry date plus the stated days or the stated date, respectively.
+The Changelog reserves the keyword `markdownlint` (any case) for standalone directives in that exact form.
+For category A, the entire reason must match `interval <N> day[s]; <text>` or
+`interval to <YYYY-MM-DD>; <text>`. Use a positive integer without leading zeroes for `N` and non-blank text,
+for example `interval 10 days; Preserve the released heading`. The expiry must be on or before the entry date
+plus the stated days or the stated date, respectively.
 
 ---
 
