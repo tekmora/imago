@@ -4,3 +4,5 @@
 pytest>=7.0.0
 jsonschema>=4.0.0
 pyyaml>=6.0.0
+# shfmt parses the provisioner scripts for tests/test_version_pins_consumed.py.
+shfmt-py>=4.2.0
