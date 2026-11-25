@@ -67,7 +67,8 @@
       "matchDepTypes": [
         "golang"
       ],
-      "rangeStrategy": "bump"
+      "rangeStrategy": "bump",
+      "minimumReleaseAge": "7 days"
     },
     {
       "matchDepNames": [

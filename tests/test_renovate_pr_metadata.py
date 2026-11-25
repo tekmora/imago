@@ -1,5 +1,5 @@
 # Copyright 2026 Lusoris
-"""Verification that renovate.json satisfies the pull-request metadata gate requirements.
+"""Verify Renovate pull-request metadata and package-rule release ages.
 
 Renovate pull requests must satisfy the governance hard gates in
 .github/workflows/pr-project-gate.yml:
@@ -93,6 +93,66 @@ def check_renovate_config(
         problems.append("labels must contain at least one 'tier/*' or 'area/*' label")
 
     return problems
+
+
+def check_package_rule_release_ages(config: dict[str, Any]) -> list[str]:
+    """Check packageRules against the Semgrep minimum release age rule."""
+    required_matchers = {"matchPackageNames", "matchPackagePatterns", "matchDepTypes"}
+    problems: list[str] = []
+    for index, rule in enumerate(config.get("packageRules", [])):
+        if "minimumReleaseAge" not in rule:
+            if required_matchers.intersection(rule):
+                problems.append(f"packageRules[{index}] is missing minimumReleaseAge")
+            continue
+
+        age = rule["minimumReleaseAge"]
+        if age is False:
+            continue
+        match = re.fullmatch(r"(\d+) days?", age, flags=re.ASCII) if isinstance(age, str) else None
+        if match is None or int(match[1]) < 7:
+            problems.append(f"packageRules[{index}].minimumReleaseAge must be false or at least 7 days, got {age!r}")
+    return problems
+
+
+def test_renovate_package_rule_release_ages() -> None:
+    problems = check_package_rule_release_ages(load_renovate_config())
+    assert not problems, "\n".join(problems)
+
+
+@pytest.mark.parametrize("matcher", ["matchDepTypes", "matchPackageNames", "matchPackagePatterns"])
+def test_release_age_required_for_package_matchers(matcher: str) -> None:
+    config = {"packageRules": [{matcher: ["example"]}]}
+    assert check_package_rule_release_ages(config) == ["packageRules[0] is missing minimumReleaseAge"]
+
+    config["packageRules"][0]["minimumReleaseAge"] = "7 days"
+    assert check_package_rule_release_ages(config) == []
+
+
+@pytest.mark.parametrize(
+    ("rule", "accepted"),
+    [
+        pytest.param({"matchDepTypes": ["golang"], "minimumReleaseAge": "3 days"}, False, id="three-days"),
+        pytest.param({"matchDepTypes": ["golang"], "minimumReleaseAge": "1 week"}, False, id="week-unit"),
+        pytest.param({"matchDepTypes": ["golang"], "minimumReleaseAge": "7 days"}, True, id="seven-days"),
+        pytest.param({"matchDepTypes": ["golang"], "minimumReleaseAge": "1 day"}, False, id="one-day"),
+        pytest.param({"matchDepTypes": ["golang"], "minimumReleaseAge": "7 day"}, True, id="singular-day-unit"),
+        pytest.param({"matchDepTypes": ["golang"], "minimumReleaseAge": False}, True, id="false-opt-out"),
+        pytest.param({"matchDepTypes": ["golang"], "minimumReleaseAge": True}, False, id="true"),
+        pytest.param({"matchDepTypes": ["golang"], "minimumReleaseAge": None}, False, id="null"),
+        pytest.param({"matchDepTypes": ["golang"], "minimumReleaseAge": 7}, False, id="number"),
+        pytest.param({"matchManagers": ["gomod"]}, True, id="manager-only-without-age"),
+        pytest.param({"matchDepNames": ["go"], "minimumReleaseAge": "6 days"}, False, id="short-age-on-any-rule"),
+    ],
+)
+def test_release_age_allow_list(rule: dict[str, Any], accepted: bool) -> None:
+    config = {"packageRules": [{"matchManagers": ["gomod"]}, rule]}
+    problems = check_package_rule_release_ages(config)
+    expected = []
+    if not accepted:
+        expected.append(
+            f"packageRules[1].minimumReleaseAge must be false or at least 7 days, got {rule['minimumReleaseAge']!r}"
+        )
+    assert problems == expected
 
 
 def test_renovate_pr_metadata():
