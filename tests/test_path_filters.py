@@ -249,9 +249,10 @@ def test_glob_regex_semantics(pattern, hit, miss):
     [
         ".github/requirements/sast.txt",
         ".github/requirements/sast-overrides.txt",
+        "CHANGELOG.md",
     ],
 )
-def test_test_python_filter_matches_sast_requirements(path: str) -> None:
-    """Modifying SAST locks or overrides must run the pytest suite (governance floor checks, #204)."""
+def test_test_python_filter_matches_required_inputs(path: str) -> None:
+    """Run Python tests for SAST pins (#204) and changelog exceptions (#278)."""
     patterns = [glob_regex(p) for p in flatten(filters()["test-python"])]
     assert any(regex.match(path) for regex in patterns), f"test-python: {path} not in its filter"

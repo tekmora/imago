@@ -63,6 +63,7 @@ test-python:
   - *shell
   - *workflows
   - '.github/requirements/**'
+  - 'CHANGELOG.md'
 docs-strict:
   - *docs
   - *workflows
