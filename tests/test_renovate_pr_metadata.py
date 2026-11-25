@@ -123,6 +123,51 @@ def test_renovate_pr_metadata():
     assert label_gate_regex.search(json.dumps(labels)) is not None
 
 
+def test_renovate_updates_go_pins_together() -> None:
+    config = load_renovate_config()
+    rules = config["packageRules"]
+    assert any(
+        rule.get("matchManagers") == ["gomod"]
+        and rule.get("matchDepNames") == ["go"]
+        and rule.get("matchDepTypes") == ["golang"]
+        and rule.get("rangeStrategy") == "bump"
+        for rule in rules
+    ), "Go directives need the gomod bump opt-in"
+    assert any(
+        rule.get("matchDepNames") == ["go"]
+        and rule.get("groupName")
+        and rule.get("groupSlug")
+        and {key for key in rule if key.startswith("match")} == {"matchDepNames"}
+        for rule in rules
+    ), "All Go pins need one group across managers"
+    assert any(rule.get("groupSlug") == "go-modules" and rule.get("matchDepNames") == ["!go"] for rule in rules), (
+        "The go-modules group must exclude Go directives"
+    )
+
+    needs = ROOT / ".needs.yaml"
+    managers = [
+        manager
+        for manager in config["customManagers"]
+        if manager.get("customType") == "regex"
+        and manager.get("depNameTemplate") == "go"
+        and manager.get("datasourceTemplate") == "golang-version"
+    ]
+    assert len(managers) == 1, "One regex manager must track the .needs.yaml Go pin"
+    manager = managers[0]
+    assert any(re.search(pattern[1:-1], needs.name) for pattern in manager["managerFilePatterns"])
+    content = needs.read_text(encoding="utf-8")
+    pins = [
+        match["currentValue"]
+        for pattern in manager["matchStrings"]
+        for match in re.finditer(pattern.replace("(?<", "(?P<"), content)
+    ]
+    assert len(pins) == 1, "The regex manager must capture the real go_version line"
+    for path in (ROOT / "go.mod", ROOT / "tools/govulncheck/go.mod"):
+        directive = re.search(r"^go (\S+)$", path.read_text(encoding="utf-8"), re.MULTILINE)
+        assert directive is not None
+        assert pins[0] == directive[1], f"{path.relative_to(ROOT)} must match the .needs.yaml Go pin"
+
+
 def test_checker_refuses_unpatched_config():
     """Verify the checker refuses a config without milestone, labels=['dependencies'], and no ref note."""
     issue_regex, _ = parse_gate_regexes()

@@ -1,6 +1,6 @@
 module github.com/cordanaLLM/imago
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/golusoris/golusoris/core v0.12.1

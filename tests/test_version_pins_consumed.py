@@ -11,6 +11,8 @@ import re
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILDS_HCL_PATH = REPO_ROOT / "packer" / "builds.pkr.hcl"
 PROVISIONERS_DIR = REPO_ROOT / "packer" / "provisioners"
@@ -25,17 +27,28 @@ ENROOT_TARGETS = {
     "ai-infer-nvidia-bleeding",
 }
 
-_PARAMETER_NAME = r"\$\{?([A-Za-z_][A-Za-z_0-9]*)"
-_EXPANSION = re.compile(rf"\\.|{_PARAMETER_NAME}", re.DOTALL)
+_NAME = r"[A-Za-z_](?:(?:\\\n)*[A-Za-z_0-9])*"
+_PARAMETER = rf"\$(?:\\\n)*(?:\{{(?:\\\n)*(?:[#!](?:\\\n)*)?)?(?P<parameter>{_NAME})"
+_EXPANSION = re.compile(rf"\\.|(?P<arithmetic>\$\(\()|{_PARAMETER}", re.DOTALL)
+_ARITHMETIC_TOKEN = re.compile(
+    rf"\\.|{_PARAMETER}|(?P<bare>{_NAME})(?P<assignment>[ \t]*=(?!=))?|[0-9][A-Za-z_0-9#@]*|[()]",
+    re.DOTALL,
+)
+_DELIMITER_PART = r"""'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s'"\\;&|()<>]+"""
+_DELIMITER_PARTS = re.compile(_DELIMITER_PART, re.DOTALL)
+_DOUBLE_QUOTED_ESCAPE = re.compile(r'\\([$`"\\\n])')
 _SHELL_TOKEN = re.compile(
     rf"""
     (?P<newline>\n)
-    | (?<![^\s;&|()<>])\#[^\n]*
-    | (?<!<)<<(?P<tabs>-?)[ \t]*(?P<quote>['"]?)(?P<delimiter>[A-Za-z_][A-Za-z_0-9]*)
-      (?P=quote)(?=[\s;&|()<>]|$)
+    | (?P<hash>\#)
+    | (?P<arithmetic>\$?\(\()
+    | (?<!<)<<(?P<tabs>-?)[ \t]*(?P<delimiter>(?:{_DELIMITER_PART})++)(?=[\s;&|()<>]|$)
     | \$'(?:\\.|[^'\\])*' | '[^']*'
-    | (?P<expanding>"(?:\\.|[^"\\])*"|{_PARAMETER_NAME})
-    | \\.
+    | (?P<quoted>"(?:\\.|[^"\\])*")
+    | {_PARAMETER}
+    | (?P<continuation>\\\n) | \\.
+    | (?P<boundary>[ \t;&|()<>])
+    | [^\s'"\\$\#;&|()<>]+ | .
     """,
     re.DOTALL | re.VERBOSE,
 )
@@ -58,32 +71,116 @@ def get_all_provisioner_content() -> str:
     return "\n".join(s.read_text(encoding="utf-8") for s in scripts)
 
 
-def is_pin_read_by_provisioners(name: str, provisioner_content: str) -> bool:
-    """Find an exact pin expansion in shell text, including multiline strings and heredocs."""
+def _arithmetic_read(name: str, text: str, start: int) -> tuple[int, bool]:
+    depth = 2
+    reads = False
+    for token in _ARITHMETIC_TOKEN.finditer(text, start):
+        if token[0] == "(":
+            depth += 1
+        elif token[0] == ")":
+            depth -= 1
+            if depth == 0:
+                return token.end(), reads
+        else:
+            variable = token["parameter"] or (token["bare"] if token["assignment"] is None else None)
+            if variable and variable.replace("\\\n", "") == name:
+                reads = True
+    return start, False
+
+
+def _expansion_reads(name: str, text: str) -> bool:
     position = 0
-    heredocs: list[tuple[re.Pattern[str], bool]] = []
-    while token := _SHELL_TOKEN.search(provisioner_content, position):
+    for _ in range(len(text)):
+        token = _EXPANSION.search(text, position)
+        if token is None:
+            break
         position = token.end()
-        if token["delimiter"]:
-            tabs = r"\t*" if token["tabs"] else ""
-            terminator = re.compile(rf"^{tabs}{token['delimiter']}$", re.MULTILINE)
-            heredocs.append((terminator, not token["quote"]))
-        elif token["newline"]:
-            # Bash reads pending heredocs in redirect order once the command line ends.
-            for terminator, expands in heredocs:
-                end = terminator.search(provisioner_content, position)
-                assert end is not None, f"Missing heredoc terminator {terminator.pattern}"
-                if expands and name in _EXPANSION.findall(provisioner_content, position, end.start()):
-                    return True
-                position = end.end()
-            heredocs.clear()
-        elif token["expanding"] and name in _EXPANSION.findall(token["expanding"]):
+        if token["arithmetic"]:
+            position, reads = _arithmetic_read(name, text, position)
+            if reads:
+                return True
+        elif token["parameter"] and token["parameter"].replace("\\\n", "") == name:
             return True
     return False
 
 
+def _heredoc(word: str, strip_tabs: bool) -> tuple[re.Pattern[str], bool]:
+    parts = []
+    expands = True
+    for match in _DELIMITER_PARTS.finditer(word):
+        part = match[0]
+        if part == "\\\n":
+            continue
+        if part.startswith('"'):
+            part = _DOUBLE_QUOTED_ESCAPE.sub(lambda escape: escape[1].removesuffix("\n"), part[1:-1])
+        elif part.startswith("'"):
+            part = part[1:-1]
+        elif part.startswith("\\"):
+            part = part[1:]
+        else:
+            parts.append(part)
+            continue
+        expands = False
+        parts.append(part)
+    tabs = r"\t*" if strip_tabs else ""
+    terminator = re.compile(rf"^{tabs}{re.escape(''.join(parts))}$", re.MULTILINE)
+    return terminator, expands
+
+
+def _read_heredocs(
+    name: str, text: str, position: int, heredocs: list[tuple[re.Pattern[str], bool]]
+) -> tuple[int, bool]:
+    # Bash reads pending heredocs in redirect order once the command line ends.
+    for terminator, expands in heredocs:
+        end = terminator.search(text, position)
+        assert end is not None, f"Missing heredoc terminator {terminator.pattern}"
+        if expands and _expansion_reads(name, text[position : end.start()]):
+            return end.end(), True
+        position = end.end()
+    return position, False
+
+
+def _token_reads(name: str, token: re.Match[str]) -> bool:
+    if token["quoted"]:
+        return _expansion_reads(name, token["quoted"][1:-1])
+    return bool(token["parameter"] and token["parameter"].replace("\\\n", "") == name)
+
+
+def is_pin_read_by_provisioners(name: str, provisioner_content: str) -> bool:
+    """Find an exact pin expansion in shell text, including multiline strings and heredocs."""
+    position = 0
+    at_word_start = True
+    heredocs: list[tuple[re.Pattern[str], bool]] = []
+    for _ in range(len(provisioner_content)):
+        token = _SHELL_TOKEN.match(provisioner_content, position)
+        if token is None:
+            break
+        position = token.end()
+        if token["continuation"]:
+            continue
+        if token["hash"] and at_word_start:
+            position = provisioner_content.find("\n", position)
+            if position == -1:
+                break
+            continue
+        reads = False
+        if token["arithmetic"]:
+            position, reads = _arithmetic_read(name, provisioner_content, position)
+        elif token["delimiter"]:
+            heredocs.append(_heredoc(token["delimiter"], bool(token["tabs"])))
+        elif token["newline"]:
+            position, reads = _read_heredocs(name, provisioner_content, position, heredocs)
+            heredocs.clear()
+        else:
+            reads = _token_reads(name, token)
+        if reads:
+            return True
+        at_word_start = bool(token["boundary"] or token["newline"])
+    return False
+
+
 class TestVersionPinsConsumed:
-    def test_pin_reader_detection(self) -> None:
+    def test_pin_reader_basics(self) -> None:
         """A pin counts as read only through a shell expansion of its exact name."""
         content = (
             'CUDA_VER="${CUDA_LEGACY:?}"\necho "$ROCM_VERSION"\n# ROCM_LEGACY_VERSION is gone\n'
@@ -117,6 +214,33 @@ class TestVersionPinsConsumed:
             "QUOTED_PIN",
             "HEREDOC_PIN",
         ]
+
+    @pytest.mark.parametrize(
+        ("content", "read", "unread"),
+        [
+            pytest.param('echo $((1 << WIDTH))\necho "$PIN"', ("WIDTH", "PIN"), ("WID", "PIN2"), id="shift-expansion"),
+            pytest.param('((n = 1 << (WIDTH + 1)))\necho "$PIN"', ("WIDTH", "PIN"), ("WID", "n"), id="shift-command"),
+            pytest.param('echo "$((1 << WIDTH))"', ("WIDTH",), ("WID",), id="quoted-arithmetic"),
+            pytest.param("cat <<E'OF'\n$LITERAL\nEOF\necho $PIN", ("PIN",), ("LITERAL",), id="single-quoted-delimiter"),
+            pytest.param("cat <<\\EOF\n$LITERAL\nEOF\necho $PIN", ("PIN",), ("LITERAL",), id="escaped-delimiter"),
+            pytest.param(
+                'cat <<-"E"OF\n\t$LITERAL\n\tEOF\necho $PIN', ("PIN",), ("LITERAL",), id="quoted-tab-delimiter"
+            ),
+            pytest.param("cat <<EOF\n${#PIN} ${!INDIRECT}\nEOF", ("PIN", "INDIRECT"), ("PI",), id="expanding-heredoc"),
+            pytest.param(
+                'echo "${#PIN}" "${!OTHER_PIN}"', ("PIN", "OTHER_PIN"), ("PI", "OTHER"), id="parameter-operators"
+            ),
+            pytest.param("echo '${#PIN} ${!OTHER_PIN}'", (), ("PIN", "OTHER_PIN"), id="literal-parameter-operators"),
+            pytest.param("echo word\\\n#$PIN # $COMMENT", ("PIN",), ("COMMENT",), id="continued-word"),
+            pytest.param('echo "$PI\\\nN"', ("PIN",), ("PI",), id="continued-parameter"),
+            pytest.param("echo word \\\n# $PIN", (), ("PIN",), id="continued-before-comment"),
+        ],
+    )
+    def test_pin_reader_detection(self, content: str, read: tuple[str, ...], unread: tuple[str, ...]) -> None:
+        for name in read:
+            assert is_pin_read_by_provisioners(name, content), f"missed read of {name}"
+        for name in unread:
+            assert not is_pin_read_by_provisioners(name, content), f"unexpected read of {name}"
 
     def test_exceptions_validity(self) -> None:
         """Verify exceptions: unexpired, present in common_env, and not consumed (no stale entry)."""

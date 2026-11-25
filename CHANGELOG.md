@@ -238,6 +238,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Raised Go to 1.27.4 for GO-2026-6859 (`net/http`). Renovate now proposes updates to both `go` directives and `.needs.yaml` in one pull request.
 - The pre-commit markdownlint hook covers `CHANGELOG.md` again. The duplicate Unreleased subsections are merged, and the released heading carries a dated category C MD024 exception. `tests/test_changelog_lint_exceptions.py` fails once the exception expires (#278).
 - Expired exceptions that turned `main` red: the pin exceptions for `CUDA_LEGACY`, `CUDA_MAINSTREAM` and `ROCM_LEGACY_VERSION` in `tests/test_version_pins_consumed.py` lapsed on 2026-11-08 and failed the Pytest suite on every branch. `33-gpu-nvidia-legacy.sh` and `34-gpu-nvidia-mainstream.sh` now require their CUDA label and print it in the build log, as the modern and bleeding scripts already do. `ROCM_LEGACY_VERSION` is no longer passed to the build because no flavor installs it; `versions.json` keeps the pin for the upstream check (`docs/hardware/amd.md`). The codespell exception for the minified `tools/figures/player/player.js` bundle in `.standards.yaml` lapsed on 2026-11-04 and failed `praetorctl audit`; it is renewed as category C until 2026-12-05.
 - Path filter for `test-python` now includes `.github/requirements/**` so changes to SAST locks or overrides run the Pytest verification suite and governance override floor checks (#204).

@@ -56,6 +56,13 @@ Across the reference repositories, the stable architectural pattern is:
 | **Declarative Epics & Milestones** | **Adopted** | `.github/epics.json`, `.github/milestones.json`, and automated PR hard gate (`pr-project-gate.yml`) |
 | **Universal Architecture & Survey** | **Adopted** | `x86_64`, `arm64` (RPi 5/Rockchip/Apple Silicon), `riscv64`, 2 Datacenter Tiers, and recurring sync cadences |
 
+### Changelog Lint Exceptions
+
+Place `<!-- lint-exception: rule MD024, category A, entered YYYY-MM-DD, expires YYYY-MM-DD, issue 123: reason -->`
+immediately above the standalone `markdownlint-disable-next-line` directive and use the same rule list in both.
+For category A, state `interval <N> days` or `interval to <YYYY-MM-DD>` in the reason. The expiry must be on or
+before the entry date plus the stated days or the stated date, respectively.
+
 ---
 
 ## 4. Host Controls Verified on GitHub
