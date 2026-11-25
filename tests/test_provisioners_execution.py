@@ -35,6 +35,20 @@ def require_bash():
     check_bash(GIT_BASH)
 
 
+@pytest.fixture
+def nvidia_ctk_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Stand in for a host executable and leave a marker beyond the sandbox if called."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "nvidia-ctk"
+    executable.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "$MOCK_CTK_HOST_WRITE"\n', encoding="utf-8")
+    executable.chmod(0o755)
+    marker = tmp_path / "nvidia-ctk-host-write"
+    monkeypatch.setenv("PATH", str(bin_dir), prepend=os.pathsep)
+    monkeypatch.setenv("MOCK_CTK_HOST_WRITE", marker.as_posix())
+    return marker
+
+
 class TestProvisionersExecution:
     def test_00_base_strip_execution(self, tmp_path: Path, require_bash) -> None:
         """Verify 00-base-strip.sh executes cleanly, purges snapd, and hardens OpenSSH."""
@@ -113,7 +127,7 @@ class TestProvisionersExecution:
 
     @pytest.mark.parametrize(("script", "env"), sorted(NVIDIA_ENV.items()))
     def test_nvidia_driver_branch_logs_its_cuda_label(
-        self, tmp_path: Path, require_bash, script: str, env: dict[str, str]
+        self, tmp_path: Path, require_bash, nvidia_ctk_on_path: Path, script: str, env: dict[str, str]
     ) -> None:
         """The legacy and mainstream branches read their CUDA pin and log it with the driver branch."""
         res = MockSandbox(tmp_path).run_script(PROVISIONERS_DIR / script, env_vars=env)
@@ -121,6 +135,19 @@ class TestProvisionersExecution:
         branch = next(value for name, value in env.items() if name.startswith("NVIDIA_"))
         cuda = next(value for name, value in env.items() if name.startswith("CUDA_"))
         assert f"branch {branch} (CUDA {cuda})" in res.stdout
+        assert res.find_commands("nvidia-ctk") == ["nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"]
+
+    @pytest.mark.parametrize(("script", "env"), sorted(NVIDIA_ENV.items()))
+    def test_nvidia_cdi_failure_warns_without_running_the_path_executable(
+        self, tmp_path: Path, require_bash, nvidia_ctk_on_path: Path, script: str, env: dict[str, str]
+    ) -> None:
+        """An executable on PATH cannot escape the sandbox, even when the mock fails."""
+        res = MockSandbox(tmp_path).run_script(PROVISIONERS_DIR / script, env_vars={**env, "MOCK_FAIL": "nvidia-ctk"})
+
+        assert not nvidia_ctk_on_path.exists(), "The executable on PATH wrote outside the sandbox"
+        assert res.find_commands("nvidia-ctk") == ["nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"]
+        assert "nvidia-ctk cdi generate returned non-zero" in res.stderr
+        assert res.returncode == 0, res.stderr
 
     @pytest.mark.parametrize(
         ("script", "unset"), [(script, name) for script, env in sorted(NVIDIA_ENV.items()) for name in sorted(env)]

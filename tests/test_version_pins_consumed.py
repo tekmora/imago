@@ -63,6 +63,17 @@ class TestVersionPinsConsumed:
         assert not is_pin_read_by_provisioners("CUDA_LEGACY_EXTRA", content)
         assert not is_pin_read_by_provisioners("CUDA", content)
 
+        multiline = (
+            'echo "labels:\n  # cuda $QUOTED_PIN\n"\n'
+            'cat <<EOF\n# driver ${HEREDOC_PIN}\nEOF\n'
+            '# echo "$COMMENTED_PIN"\n'
+        )
+        candidates = ["QUOTED_PIN", "HEREDOC_PIN", "COMMENTED_PIN"]
+        assert [name for name in candidates if is_pin_read_by_provisioners(name, multiline)] == [
+            "QUOTED_PIN",
+            "HEREDOC_PIN",
+        ]
+
     def test_exceptions_validity(self) -> None:
         """Verify exceptions: unexpired, present in common_env, and not consumed (no stale entry)."""
         common_env_names = get_common_env_names()

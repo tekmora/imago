@@ -53,10 +53,11 @@ The monthly cadence is overseen by release maintainers following standard SOPs:
      `0.1.0 — First release` names; `tests/test_governance.py` refuses any later version
      while that milestone is open. Later versions follow from the
      Conventional Commits merged since the last tag.
-   - `release-please` opens that pull request with the workflow token, so the repository must
-     allow GitHub Actions to create pull requests. `overrides.actions` in `.standards.yaml`
-     declares that setting; when it is withdrawn, the online `praetorctl audit` fails with
-     `Actions workflow permissions drifted` before a release run would.
+   - The repository and organisation keep Actions pull request creation and approval off.
+     `.standards.yaml` declares `allow_create_and_approve_pull_requests: false` under
+     `overrides.actions`, and the online `praetorctl audit` fails when the forge value drifts.
+     `release-please` cannot open the release pull request with the workflow token.
+     Issue #256 tracks the move to the release app.
 2. **CVE Drift Reconciliation**:
    - Run Trivy and Grype against base image rootfs artifacts.
    - Any disclosed High/Critical vulnerabilities without upstream deb patches are flagged for mitigation or base package pinning.

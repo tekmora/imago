@@ -65,8 +65,8 @@ overrides:
         slsa_level: 3
         enforce_cosign: true
         require_sbom: true
-    # Declared at the live repository and organisation value; GITHUB_TOKEN cannot open the
-    # release pull request, so release-please needs its own app token (issue #45).
+    # The repository and organisation both set this to false. The workflow token cannot
+    # open the release pull request. Issue #256 moves release-please to the release app.
     actions:
         default_workflow_permissions: read
         allow_create_and_approve_pull_requests: false
