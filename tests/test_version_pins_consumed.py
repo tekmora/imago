@@ -25,6 +25,21 @@ ENROOT_TARGETS = {
     "ai-infer-nvidia-bleeding",
 }
 
+_PARAMETER_NAME = r"\$\{?([A-Za-z_][A-Za-z_0-9]*)"
+_EXPANSION = re.compile(rf"\\.|{_PARAMETER_NAME}", re.DOTALL)
+_SHELL_TOKEN = re.compile(
+    rf"""
+    (?P<newline>\n)
+    | (?<![^\s;&|()<>])\#[^\n]*
+    | (?<!<)<<(?P<tabs>-?)[ \t]*(?P<quote>['"]?)(?P<delimiter>[A-Za-z_][A-Za-z_0-9]*)
+      (?P=quote)(?=[\s;&|()<>]|$)
+    | \$'(?:\\.|[^'\\])*' | '[^']*'
+    | (?P<expanding>"(?:\\.|[^"\\])*"|{_PARAMETER_NAME})
+    | \\.
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+
 
 def get_common_env_names() -> list[str]:
     hcl = BUILDS_HCL_PATH.read_text(encoding="utf-8")
@@ -44,9 +59,27 @@ def get_all_provisioner_content() -> str:
 
 
 def is_pin_read_by_provisioners(name: str, provisioner_content: str) -> bool:
-    """A pin is read when a line that is not a whole-line shell comment expands its exact name."""
-    pattern = re.compile(rf"\$\{{?{name}\b")
-    return any(pattern.search(line) for line in provisioner_content.splitlines() if not line.lstrip().startswith("#"))
+    """Find an exact pin expansion in shell text, including multiline strings and heredocs."""
+    position = 0
+    heredocs: list[tuple[re.Pattern[str], bool]] = []
+    while token := _SHELL_TOKEN.search(provisioner_content, position):
+        position = token.end()
+        if token["delimiter"]:
+            tabs = r"\t*" if token["tabs"] else ""
+            terminator = re.compile(rf"^{tabs}{token['delimiter']}$", re.MULTILINE)
+            heredocs.append((terminator, not token["quote"]))
+        elif token["newline"]:
+            # Bash reads pending heredocs in redirect order once the command line ends.
+            for terminator, expands in heredocs:
+                end = terminator.search(provisioner_content, position)
+                assert end is not None, f"Missing heredoc terminator {terminator.pattern}"
+                if expands and name in _EXPANSION.findall(provisioner_content, position, end.start()):
+                    return True
+                position = end.end()
+            heredocs.clear()
+        elif token["expanding"] and name in _EXPANSION.findall(token["expanding"]):
+            return True
+    return False
 
 
 class TestVersionPinsConsumed:
@@ -65,10 +98,21 @@ class TestVersionPinsConsumed:
 
         multiline = (
             'echo "labels:\n  # cuda $QUOTED_PIN\n"\n'
-            'cat <<EOF\n# driver ${HEREDOC_PIN}\nEOF\n'
+            "cat <<EOF\n# driver ${HEREDOC_PIN}\nEOF\n"
             '# echo "$COMMENTED_PIN"\n'
+            "echo ready # $INLINE_COMMENT_PIN\n"
+            "cat <<'EOF'\nliteral $QUOTED_HEREDOC_PIN\nEOF\n"
+            "printf '%s' '$SINGLE_QUOTED_PIN' \"\\$ESCAPED_PIN\"\n"
         )
-        candidates = ["QUOTED_PIN", "HEREDOC_PIN", "COMMENTED_PIN"]
+        candidates = [
+            "QUOTED_PIN",
+            "HEREDOC_PIN",
+            "COMMENTED_PIN",
+            "INLINE_COMMENT_PIN",
+            "QUOTED_HEREDOC_PIN",
+            "SINGLE_QUOTED_PIN",
+            "ESCAPED_PIN",
+        ]
         assert [name for name in candidates if is_pin_read_by_provisioners(name, multiline)] == [
             "QUOTED_PIN",
             "HEREDOC_PIN",

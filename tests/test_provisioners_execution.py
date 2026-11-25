@@ -18,8 +18,8 @@ ROCM_ENV = {"ROCM_VERSION": "7.2.4", "ROCM_REPO": "https://repo.example.com/rocm
 K8S_ENV = {"CDEBUG_VERSION": "0.0.0", "K8S_VERSION": "1.37.0", "CRUN_VERSION": "1.20"}
 PODMAN_ENV = {"CDEBUG_VERSION": "0.0.0", "CRUN_VERSION": "1.20"}
 NVIDIA_ENV = {
-    "33-gpu-nvidia-legacy.sh": {"NVIDIA_LEGACY_DRIVER": "580", "CUDA_LEGACY": "13.0"},
-    "34-gpu-nvidia-mainstream.sh": {"NVIDIA_MAINSTREAM_DRIVER": "595", "CUDA_MAINSTREAM": "13.2"},
+    "33-gpu-nvidia-legacy.sh": {"NVIDIA_LEGACY_DRIVER": "0", "CUDA_LEGACY": "0.0.0"},
+    "34-gpu-nvidia-mainstream.sh": {"NVIDIA_MAINSTREAM_DRIVER": "0", "CUDA_MAINSTREAM": "0.0.0"},
 }
 PROVISIONERS_DIR = REPO_ROOT / "packer" / "provisioners"
 
