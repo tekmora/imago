@@ -18,6 +18,8 @@ Refuse arithmetic, indirection, dynamic variable names and dynamic code in the l
 
 Refuse unquoted parameter, command, arithmetic and process expansions in simple command words, loop word lists, array literal elements and non-assignment declaration words. Bash can split unquoted expansions into run-time words in these positions. Refuse `env -S` and `env --split-string`, including clustered short options and literal values, because `env` splits and expands the value itself.
 
+Resolve long options using each prefix command's getopt rules, refuse unknown or ambiguous options, and treat any `env` operand containing `=` before the command as an assignment.
+
 Alias and function shadowing of command names are outside the tripwire's scope.
 
 ## Consequences

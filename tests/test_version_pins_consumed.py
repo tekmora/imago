@@ -79,6 +79,7 @@ _CONSTRUCT_REFUSALS = {
     "dynamic code": "the code word must be fully literal",
     "dynamic command": "the command name must be fully literal",
     "dynamic option": "an option or test operator word must be fully literal",
+    "unresolved option": "the command reads an abbreviated or unknown long option the reader cannot resolve",
     "unquoted expansion": "Bash splits the result into words at run time",
     "split string": "env re-splits and expands the value itself",
     "eval": "eval reparses its arguments as shell code",
@@ -94,30 +95,75 @@ _SHELL_COMMANDS = {"bash", "sh"}
 _MAPFILE_OPTIONS = set("dnOsuCc")
 _NAME_COMMANDS = {"[", "test", "printf", "getopts", "read", "mapfile", "readarray", "unset", "printenv"}
 _CODE_COMMANDS = {"eval", "trap", ".", "source", "bash", "sh", "mapfile", "readarray"}
+
+
+class PrefixOptions(NamedTuple):
+    short_values: str = ""
+    long_required: tuple[str, ...] = ()
+    long_optional: tuple[str, ...] = ()
+    long_switches: tuple[str, ...] = ()
+
+
 _PREFIX_OPTIONS = {
-    "sudo": set("aCcDghpRrtTu")
-    | {
-        "auth-type",
-        "chdir",
-        "close-from",
-        "group",
-        "host",
-        "prompt",
-        "user",
-        "chroot",
-        "role",
-        "type",
-        "command-timeout",
-    },
-    "env": {"a", "C", "S", "u", "argv0", "chdir", "split-string", "unset", "env0-from"},
-    "exec": {"a"},
-    "command": set(),
-    "builtin": set(),
-    "nohup": set(),
-    "timeout": {"k", "s", "kill-after", "signal"},
+    # Sudo 1.9.17p2 sudo(8) and the installed sudo_long_opts table.
+    "sudo": PrefixOptions(
+        "aCcDghpRrtTu",
+        (
+            "auth-type",
+            "chdir",
+            "chroot",
+            "close-from",
+            "command-timeout",
+            "group",
+            "host",
+            "login-class",
+            "other-user",
+            "prompt",
+            "role",
+            "type",
+            "user",
+        ),
+        ("preserve-env",),
+        (
+            "askpass",
+            "background",
+            "bell",
+            "edit",
+            "help",
+            "list",
+            "login",
+            "no-update",
+            "non-interactive",
+            "preserve-groups",
+            "remove-timestamp",
+            "reset-timestamp",
+            "set-home",
+            "shell",
+            "stdin",
+            "validate",
+            "version",
+        ),
+    ),
+    # GNU coreutils 9.12 --help.
+    "env": PrefixOptions(
+        "aCSu",
+        ("argv0", "chdir", "env0-from", "split-string", "unset"),
+        ("block-signal", "default-signal", "ignore-signal"),
+        ("debug", "help", "ignore-environment", "list-signal-handling", "null", "version"),
+    ),
+    "nohup": PrefixOptions(long_switches=("help", "version")),
+    "timeout": PrefixOptions(
+        "ks",
+        ("kill-after", "signal"),
+        long_switches=("foreground", "help", "preserve-status", "verbose", "version"),
+    ),
+    # Bash 5.3.20 builtin help and option handling.
+    "exec": PrefixOptions("a"),
+    "command": PrefixOptions(),
+    "builtin": PrefixOptions(),
 }
 _OPTION_VALUES = {
-    **_PREFIX_OPTIONS,
+    **{command: set(options.short_values) | set(options.long_required) for command, options in _PREFIX_OPTIONS.items()},
     ".": {"p"},
     "source": {"p"},
     "bash": {"O", "o", "+O", "+o", "init-file", "rcfile"},
@@ -367,21 +413,36 @@ def _option_fields(word: str) -> Iterator[tuple[str, str | None]]:
             yield key, word[position + 1 :] or None
 
 
-def _take_options(command: str, args: list[Argument]) -> tuple[dict[str, Argument | None], list[Argument], bool]:
+def _resolve_long_option(flag: str, options: PrefixOptions) -> str | None:
+    names = (*options.long_required, *options.long_optional, *options.long_switches)
+    if flag in names:
+        return flag
+    matches = [name for name in names if name.startswith(flag)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _take_options(
+    command: str, args: list[Argument]
+) -> tuple[dict[str, Argument | None], list[Argument], list[Violation]]:
     options: dict[str, Argument | None] = {}
+    violations: list[Violation] = []
+    prefix = _PREFIX_OPTIONS.get(command)
     takes_value = _OPTION_VALUES.get(command, set())
     signs = ("-", "+") if command in _REFERENCE_DECLARATIONS | _SHELL_COMMANDS else ("-",)
-    dynamic_option = False
     index = 0
     while index < len(args):
         argument = args[index]
         dynamic = isinstance(argument, DynamicWord)
         word = argument.prefix if dynamic else argument
-        if dynamic and (not word or word.startswith(signs)):
-            dynamic_option = True
+        if dynamic and (not word or word.startswith(signs)) and not violations:
+            violations.append(("dynamic option", f"{command} options"))
         if not dynamic and (word == "--" or (word == "-" and command in _SHELL_COMMANDS)):
             index += 1
             break
+        # sudo reads VAR=value among its options and treats leading / or = as a command operand.
+        if command == "sudo" and not word.startswith(("-", "/", "=")) and "=" in word:
+            index += 1
+            continue
         if (
             not word
             or word in {"-", "+"}
@@ -390,17 +451,26 @@ def _take_options(command: str, args: list[Argument]) -> tuple[dict[str, Argumen
         ):
             break
         index += 1
-        for flag, attached in _option_fields(word):
-            if flag not in takes_value:
+        for spelling, attached in _option_fields(word):
+            flag = spelling
+            if prefix is not None and word.startswith("--"):
+                resolved = _resolve_long_option(flag, prefix)
+                if resolved is None:
+                    violations.append(("unresolved option", f"{command} --{flag}"))
+                    return options, [], violations
+                flag = resolved
+            required = flag in takes_value
+            optional = prefix is not None and flag in prefix.long_optional
+            if not required and not optional:
                 options[flag] = None
                 continue
             value: Argument | None = DynamicWord(attached or "") if dynamic else attached
-            if value is None and index < len(args):
+            if required and value is None and index < len(args):
                 value = args[index]
                 index += 1
             options[flag] = value
             break
-    return options, args[index:], dynamic_option
+    return options, args[index:], violations
 
 
 def _invoked_command(words: list[Node]) -> tuple[str, list[Node], list[Violation]]:
@@ -416,20 +486,19 @@ def _invoked_command(words: list[Node]) -> tuple[str, list[Node], list[Violation
         if command not in _PREFIX_OPTIONS:
             return command, words, violations
         values = [_command_word(word) for word in words]
-        options, remaining, dynamic_option = _take_options(command, values)
-        if dynamic_option:
-            violations.append(("dynamic option", f"{command} options"))
+        options, remaining, option_violations = _take_options(command, values)
+        violations.extend(option_violations)
         if command == "env" and options.keys() & {"S", "split-string"}:
             violations.append(("split string", "env split-string option"))
         if command == "command" and options.keys() & {"v", "V"}:
             break
         skipped = len(words) - len(remaining)
-        if command in {"env", "sudo"}:
-            for value in remaining:
-                if (command == "env" and value == "-") or _assignment_name(value):
-                    skipped += 1
-                else:
+        if command == "env":
+            for index, value in enumerate(remaining):
+                literal = value.prefix if isinstance(value, DynamicWord) else value
+                if "=" not in literal and not (index == 0 and value == "-"):
                     break
+                skipped += 1
         words = words[skipped + (command == "timeout") :]
         prefix = command
     return "", [], violations
@@ -525,9 +594,8 @@ def _command_violations(command: str, args: list[Argument]) -> Iterator[Violatio
         yield "eval", "eval"
         flags, operands = {}, args
     else:
-        flags, operands, dynamic_option = _take_options(command, args)
-        if dynamic_option:
-            yield "dynamic option", f"{command} options"
+        flags, operands, violations = _take_options(command, args)
+        yield from violations
     if command in _DECLARATIONS:
         yield from _declaration_violations(command, flags, operands)
     if any(not _plain_name(name) for name in _name_operands(command, flags, operands)):
@@ -989,6 +1057,51 @@ class TestVersionPinsConsumed:
             return
         with pytest.raises(PinRefusal, match=rf"(?m)^round-ten\.sh:\d+: \[{group}\] .+ at File\.Stmts"):
             _pins_read(content, "round-ten.sh", {"PIN"})
+
+    @pytest.mark.parametrize(
+        ("content", "group"),
+        [
+            pytest.param("""env --split-str '/usr/bin/printenv P"I"N'""", "split string", id="env-split-str"),
+            pytest.param("""env --split '/usr/bin/printenv P"I"N'""", "split string", id="env-split"),
+            pytest.param("""env --sp='/usr/bin/printenv P"I"N'""", "split string", id="env-sp-attached"),
+            pytest.param("""env X-Y=1 env -S '/usr/bin/printenv P"I"N'""", "split string", id="env-punctuated-name"),
+            pytest.param("""env 'a b=1' env -S '/usr/bin/printenv P"I"N'""", "split string", id="env-space-in-name"),
+            pytest.param("""env =x env -S '/usr/bin/printenv P"I"N'""", "split string", id="env-empty-name"),
+            pytest.param("""x='/usr/bin/printenv P"I"N'; env -S"$x" """, "split string", id="env-short-attached"),
+            pytest.param("""env -uX -S '/usr/bin/printenv P"I"N'""", "split string", id="env-unset-cluster"),
+            pytest.param("""sudo env -S '/usr/bin/printenv P"I"N'""", "split string", id="sudo-env"),
+            pytest.param(
+                """sudo X-Y=1 --preserve-env env -S '/usr/bin/printenv P"I"N'""",
+                "split string",
+                id="sudo-assignment-and-option",
+            ),
+            pytest.param("""exec env -S '/usr/bin/printenv P"I"N'""", "split string", id="exec-env"),
+            pytest.param(
+                """env --default-signal env -S '/usr/bin/printenv P"I"N'""", "split string", id="env-optional"
+            ),
+            pytest.param(
+                """timeout --kill-a 1 5 env -S '/usr/bin/printenv P"I"N'""",
+                "split string",
+                id="timeout-abbreviated",
+            ),
+            pytest.param("env --d /usr/bin/true", "unresolved option", id="env-ambiguous"),
+            pytest.param("env --imago-unknown /usr/bin/true", "unresolved option", id="env-unknown"),
+            pytest.param("exec --imago-unknown /usr/bin/true", "unresolved option", id="exec-no-long-options"),
+            pytest.param("env --arg -S /usr/bin/printf x", "", id="env-argv0-abbreviated"),
+            pytest.param("env --argv0=x /usr/bin/true", "", id="env-argv0-attached"),
+            pytest.param("env --unset=PIN /usr/bin/true", "", id="env-unset-long"),
+            pytest.param("timeout --kill-after=1 5 /usr/bin/true", "", id="timeout-kill-after"),
+            pytest.param("env -i /usr/bin/true", "", id="env-ignore-environment"),
+        ],
+    )
+    def test_pin_reader_prefix_options(self, content: str, group: str) -> None:
+        # Track a different name so the literal PIN in --unset exercises only option handling.
+        pins = {"TRACKED"}
+        if not group:
+            assert _pins_read(content, "prefix.sh", pins) == set()
+            return
+        with pytest.raises(PinRefusal, match=rf"(?m)^prefix\.sh:\d+: \[{group}\] .+ at File\.Stmts"):
+            _pins_read(content, "prefix.sh", pins)
 
     def test_pin_reader_redirect_scope(self) -> None:
         contents = (
