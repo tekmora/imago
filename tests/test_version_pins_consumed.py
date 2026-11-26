@@ -33,6 +33,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILDS_HCL_PATH = REPO_ROOT / "packer" / "builds.pkr.hcl"
+PIN_ENV_PATH = REPO_ROOT / "packer" / "pin-env.json"
 PROVISIONERS_DIR = REPO_ROOT / "packer" / "provisioners"
 
 # Pins in local.common_env that no provisioner reads: name -> {reason, expires}.
@@ -126,16 +127,24 @@ _SPLITTING_WORD_EDGES = {("CallExpr", "Args"), ("WordIter", "Items"), ("ArrayEle
 _UNQUOTED_EXPANSIONS = {"ParamExp", "CmdSubst", "ArithmExp", "ProcSubst"}
 
 
+def get_pin_env_mapping() -> dict[str, str]:
+    return json.loads(PIN_ENV_PATH.read_text(encoding="utf-8"))
+
+
 def get_common_env_names() -> list[str]:
-    hcl = BUILDS_HCL_PATH.read_text(encoding="utf-8")
-    match = re.search(r"common_env\s*=\s*\[(.*?)\]", hcl, re.DOTALL)
-    assert match is not None, "local.common_env definition not found in builds.pkr.hcl"
-    names: list[str] = []
-    for line in match.group(1).splitlines():
-        clean = line.strip().strip(",").strip('"')
-        if "=" in clean:
-            names.append(clean.split("=")[0])
-    return names
+    return list(get_pin_env_mapping())
+
+
+def manifest_pin_values() -> dict[str, str]:
+    manifest = json.loads((REPO_ROOT / "versions.json").read_text(encoding="utf-8"))
+    pins = {}
+    for name, key_path in get_pin_env_mapping().items():
+        value = manifest
+        for key in key_path.split("."):
+            value = value[key]
+        assert isinstance(value, str), f"versions.json: {key_path} ({name}) must be a string"
+        pins[name] = value
+    return pins
 
 
 def _parse_script(source: bytes, filename: str) -> Node:
@@ -148,9 +157,10 @@ def _parse_script(source: bytes, filename: str) -> Node:
         )
     except subprocess.TimeoutExpired as error:
         pytest.fail(f"shfmt timed out after {error.timeout} seconds parsing {filename}", pytrace=False)
-    if result.returncode != 0:
-        pytest.fail(f"shfmt could not parse {filename}: {result.stderr.decode(errors='replace').strip()}")
-    return json.loads(result.stdout)
+    else:
+        if result.returncode != 0:
+            pytest.fail(f"shfmt could not parse {filename}: {result.stderr.decode(errors='replace').strip()}")
+        return json.loads(result.stdout)
 
 
 def _unquoted_heredoc(node: Node) -> bool:
@@ -753,6 +763,8 @@ class TestVersionPinsConsumed:
             pytest.param('unset X; echo "${X:-PIN}"', "", "PIN", "", id="literal-default-word"),
             pytest.param('X=set; echo "${X:?PIN $PIN}"', "", "PIN PIN", "", id="nonliteral-error-word"),
             pytest.param('echo "${PIN[0]}"', "", "PIN", "", id="parameter-index"),
+            pytest.param('echo "${PIN[0]:-value}"', "", "PIN", "", id="parameter-index-default"),
+            pytest.param('ref=PIN; echo "${!ref:-value}"', "", "PIN", "", id="indirect-name-default"),
             pytest.param('echo "${PIN:1}"', "", "PIN", "", id="parameter-slice"),
             pytest.param('echo "${PIN/2/replaced}"', "", "PIN", "", id="parameter-replacement"),
             pytest.param('echo "${PIN^}"', "", "PIN", "", id="parameter-case-operator"),

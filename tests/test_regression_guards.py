@@ -29,7 +29,7 @@ import yaml
 from tests.harness.live import skip_or_fail
 from tests.harness.mock_runner import GIT_BASH, MockSandbox
 from tests.test_provisioners_execution import check_bash
-from tests.test_version_pins_consumed import get_common_env_names
+from tests.test_version_pins_consumed import PIN_ENV_PATH, get_common_env_names, manifest_pin_values
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKER = ROOT / "packer"
@@ -145,17 +145,7 @@ def test_no_provisioner_seals_the_build_account_early() -> None:
 
 
 def precache_image_pins() -> dict[str, str]:
-    builds = (PACKER / "builds.pkr.hcl").read_text(encoding="utf-8")
-    manifest = json.loads((ROOT / "versions.json").read_text(encoding="utf-8"))
-    paths = dict(re.findall(r"^\s*(img_\w+)\s*=\s*local\.manifest\.([\w.]+)\s*$", builds, re.M))
-    passed = dict(re.findall(r'"(IMG_\w+)=\$\{local\.(img_\w+)\}"', builds))
-    pins: dict[str, str] = {}
-    for variable, local_var in passed.items():
-        value = manifest
-        for key in paths[local_var].split("."):
-            value = value[key]
-        pins[variable] = value
-    return pins
+    return {name: value for name, value in manifest_pin_values().items() if name.startswith("IMG_")}
 
 
 def run_precache(
@@ -220,17 +210,42 @@ def test_precache_fails_when_an_image_cannot_be_pulled(
     assert "Complete" not in result.stdout
 
 
+_SHELL_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+_PIN_DEFAULT = re.compile(rf"\$\{{({_SHELL_NAME}):?[-=]")
+_ALIAS_ASSIGNMENT = re.compile(
+    rf'(?:^|[\s;|&()])(?P<target>{_SHELL_NAME})=(?P<quote>"?)'
+    rf"\$(?:\{{(?P<braced>{_SHELL_NAME})\}}|(?P<bare>{_SHELL_NAME}))"
+    r"(?P=quote)(?=$|[\s;|&()<>])"
+)
+
+
+def _pins_and_aliases(content: str, pins: Collection[str]) -> set[str]:
+    assignments = [(match["target"], match["bare"] or match["braced"]) for match in _ALIAS_ASSIGNMENT.finditer(content)]
+    names = set(pins)
+    for _ in assignments:
+        aliases = {target for target, source in assignments if source in names} - names
+        if not aliases:
+            break
+        names.update(aliases)
+    return names
+
+
 def _pin_fallbacks(provisioners: Path, pins: Collection[str]) -> list[str]:
-    pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?[-=]")
-    return [
-        f"{script.relative_to(provisioners)}:{number}: {line.strip()}"
-        for script in sorted(provisioners.rglob("*.sh"))
-        for number, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1)
-        if any(match[1] in pins for match in pattern.finditer(line))
-    ]
+    findings = []
+    for script in sorted(provisioners.rglob("*")):
+        if script.is_symlink() or not script.is_file():
+            continue
+        content = script.read_text(encoding="utf-8", errors="replace")
+        names = _pins_and_aliases(content, pins)
+        findings.extend(
+            f"{script.relative_to(provisioners).as_posix()}:{number}: {line.strip()}"
+            for number, line in enumerate(content.splitlines(), 1)
+            if any(match[1] in names for match in _PIN_DEFAULT.finditer(line))
+        )
+    return findings
 
 
-def test_provisioners_hold_no_pin_fallbacks(tmp_path: Path) -> None:
+def test_provisioners_hold_no_direct_pin_fallbacks(tmp_path: Path) -> None:
     precache = tmp_path / PRECACHE.name
     precache.write_text('echo "${IMG_PIN:-value}"\n', encoding="utf-8")
     script = tmp_path / "52-k3s-runtime.sh"
@@ -249,8 +264,91 @@ def test_provisioners_hold_no_pin_fallbacks(tmp_path: Path) -> None:
         f'{precache.name}:1: echo "${{IMG_PIN:-value}}"',
     ]
 
+
+@pytest.mark.parametrize(
+    ("path", "assignment", "fallback", "refused"),
+    [
+        pytest.param("helper", "", 'echo "${PIN:-value}"', True, id="extensionless"),
+        pytest.param("helper.bash", "", 'echo "${PIN:-value}"', True, id="bash-extension"),
+        pytest.param("nested/helper.sh", "", 'echo "${PIN:-value}"', True, id="nested"),
+        pytest.param("helper.sh", 'alias_pin="$PIN"; ', 'x="${alias_pin:-value}"', True, id="quoted-alias"),
+        pytest.param("helper.sh", 'local a="${PIN}"\n', 'echo "${a:=value}"', True, id="local-alias"),
+        pytest.param("helper.sh", "readonly a=$PIN\nexport b=$a\n", 'echo "${b-value}"', True, id="alias-chain"),
+        pytest.param("helper.sh", 'declare a="${PIN}"\n', 'echo "${a=value}"', True, id="declare-alias"),
+        pytest.param("helper.sh", 'x="$OTHER"; ', 'echo "${x:-value}"', False, id="non-pin-alias"),
+        pytest.param("helper.sh", 'x="${PIN:?message}"\n', 'echo "${x}"', False, id="required-read"),
+    ],
+)
+def test_provisioners_hold_no_pin_fallbacks(
+    tmp_path: Path, path: str, assignment: str, fallback: str, refused: bool
+) -> None:
+    script = tmp_path / path
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(assignment + fallback + "\n", encoding="utf-8")
+    line = assignment.count("\n") + 1
+    last_line = assignment.rpartition("\n")[2] + fallback
+    expected = [f"{path}:{line}: {last_line}"] if refused else []
+    assert _pin_fallbacks(tmp_path, {"PIN"}) == expected
+
+
+@pytest.mark.parametrize("entry", ["directory", "symlink"])
+def test_pin_fallback_scan_skips_nonregular_entries(tmp_path: Path, entry: str) -> None:
+    provisioners = tmp_path / "provisioners"
+    provisioners.mkdir()
+    path = provisioners / "helper.sh"
+    if entry == "directory":
+        path.mkdir()
+    else:
+        target = tmp_path / "outside.sh"
+        target.write_text('echo "${PIN:-value}"\n', encoding="utf-8")
+        try:
+            path.symlink_to(target)
+        except (NotImplementedError, OSError) as error:
+            pytest.skip(f"Cannot create fixture symlink: {error}")
+    assert _pin_fallbacks(provisioners, {"PIN"}) == []
+
+
+def test_real_provisioners_hold_no_pin_fallbacks() -> None:
     fallbacks = _pin_fallbacks(PROVISIONERS, set(get_common_env_names()))
     assert not fallbacks, "Provisioner pin fallbacks:\n" + "\n".join(fallbacks)
+
+
+def packer_common_env(tmp_path: Path, manifest: dict) -> subprocess.CompletedProcess[str]:
+    packer = shutil.which("packer")
+    if not packer:
+        skip_or_fail("packer is required to evaluate common_env", os.environ)
+    template = tmp_path / "packer"
+    template.mkdir()
+    builds = (PACKER / "builds.pkr.hcl").read_text(encoding="utf-8")
+    locals_blocks = re.findall(r"(?ms)^locals\s*\{\n.*?^\}", builds)
+    assert locals_blocks, "packer/builds.pkr.hcl has no locals blocks"
+    (template / "locals.pkr.hcl").write_text("\n\n".join(locals_blocks) + "\n", encoding="utf-8")
+    (tmp_path / "versions.json").write_text(json.dumps(manifest), encoding="utf-8")
+    shutil.copyfile(PIN_ENV_PATH, template / PIN_ENV_PATH.name)
+    return subprocess.run(
+        [packer, "console", str(template)],
+        input="jsonencode(local.common_env)\n",
+        text=True,
+        capture_output=True,
+        timeout=COMMAND_TIMEOUT_S,
+        check=False,
+    )
+
+
+def test_packer_common_env_matches_manifest_pins(tmp_path: Path) -> None:
+    manifest = json.loads((ROOT / "versions.json").read_text(encoding="utf-8"))
+    result = packer_common_env(tmp_path, manifest)
+    assert result.returncode == 0, result.stderr
+    expected = sorted(f"{name}={value}" for name, value in manifest_pin_values().items())
+    assert sorted(json.loads(result.stdout)) == expected
+
+
+def test_packer_common_env_refuses_missing_manifest_pin(tmp_path: Path) -> None:
+    manifest = json.loads((ROOT / "versions.json").read_text(encoding="utf-8"))
+    del manifest["k3s"]["version"]
+    result = packer_common_env(tmp_path, manifest)
+    assert result.returncode != 0, result.stdout
+    assert "common_env" in result.stdout + result.stderr
 
 
 def test_every_image_read_by_precache_is_passed_by_build() -> None:

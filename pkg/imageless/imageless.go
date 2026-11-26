@@ -4,18 +4,24 @@
 package imageless
 
 import (
+	"encoding/json/v2"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
+	"github.com/cordanaLLM/imago"
 	"github.com/cordanaLLM/imago/pkg/flavors"
+	"github.com/cordanaLLM/imago/pkg/manifest"
 )
 
 // ApplyOptions configures the in-place host provisioning script.
 type ApplyOptions struct {
-	FlavorID    string
-	TargetHost  string
-	DryRun      bool
-	SkipCleanup bool
+	FlavorID     string
+	TargetHost   string
+	DryRun       bool
+	SkipCleanup  bool
+	VersionsPath string // Empty uses versions.json in the working directory.
 }
 
 // GenerateApplyScript produces an idempotent, standalone bash script to provision
@@ -32,7 +38,11 @@ func GenerateApplyScript(opts ApplyOptions) (string, error) {
 		writeDryRun(&sb, fl)
 		return sb.String(), nil
 	}
-	writeEnvironment(&sb, fl)
+	pins, err := loadPinEnvironment(opts.VersionsPath)
+	if err != nil {
+		return "", err
+	}
+	writeEnvironment(&sb, fl, pins)
 	writePipeline(&sb, fl, opts.SkipCleanup)
 	sb.WriteString("echo \"==> Imageless flavor application complete.\"\n")
 	return sb.String(), nil
@@ -57,12 +67,62 @@ func writeDryRun(sb *strings.Builder, fl flavors.Flavor) {
 	sb.WriteString("echo \"==> DRY-RUN completed successfully.\"\n")
 }
 
-func writeEnvironment(sb *strings.Builder, fl flavors.Flavor) {
+func loadPinEnvironment(path string) (map[string]string, error) {
+	if path == "" {
+		path = "versions.json"
+	}
+	m, err := manifest.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("imageless: %w", err)
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("imageless: encode manifest %s: %w", path, err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		return nil, fmt.Errorf("imageless: decode manifest %s: %w", path, err)
+	}
+	var mapping map[string]string
+	if err := json.Unmarshal(imago.PinEnvMapping, &mapping); err != nil {
+		return nil, fmt.Errorf("imageless: decode packer/pin-env.json: %w", err)
+	}
+	pins := make(map[string]string, len(mapping))
+	for _, name := range slices.Sorted(maps.Keys(mapping)) {
+		value, err := resolveManifestPin(document, mapping[name])
+		if err != nil {
+			return nil, fmt.Errorf("imageless: %s: %s (%s): %w", path, mapping[name], name, err)
+		}
+		pins[name] = value
+	}
+	return pins, nil
+}
+
+func resolveManifestPin(document map[string]any, keyPath string) (string, error) {
+	var value any = document
+	for key := range strings.SplitSeq(keyPath, ".") {
+		object, _ := value.(map[string]any)
+		var found bool
+		if value, found = object[key]; !found {
+			return "", fmt.Errorf("unknown manifest key")
+		}
+	}
+	pin, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("manifest pin must be a string, got %T", value)
+	}
+	return pin, nil
+}
+
+func writeEnvironment(sb *strings.Builder, fl flavors.Flavor, pins map[string]string) {
 	sb.WriteString("# Environment configuration\n")
 	fmt.Fprintf(sb, "export FLAVOR=\"%s\"\n", fl.ID)
 	fmt.Fprintf(sb, "export KERNEL_PROFILE=\"%s\"\n", fl.KernelProfile)
 	if fl.PreheatProfile != "" {
 		fmt.Fprintf(sb, "export PREHEAT_PROFILE=\"%s\"\n", fl.PreheatProfile)
+	}
+	for _, name := range slices.Sorted(maps.Keys(pins)) {
+		fmt.Fprintf(sb, "export %s=%s\n", name, shellQuote(pins[name]))
 	}
 	sb.WriteString("\n")
 }
