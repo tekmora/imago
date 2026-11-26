@@ -5,6 +5,7 @@
   seal runs before the power-off and a failed seal stops it.
 - #44: a preheated image that cannot be pulled fails the build; precache requires every
   image to be injected by the build with no fallback pins.
+- Provisioners require their injected pins without shell defaults or default assignments.
 - #40: the QEMU accelerator is a validated variable, and the release build emulates.
 - #43: the compress step reads the directory Packer writes the flavor's image to.
 - #39: the release build installs an ISO authoring tool before Packer writes the seed.
@@ -19,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Collection
 from pathlib import Path
 
 import pytest
@@ -26,7 +28,9 @@ import yaml
 
 from tests.harness.live import skip_or_fail
 from tests.harness.mock_runner import GIT_BASH, MockSandbox
+from tests.test_apply_required_pins import GOLDEN, _apply_blocks
 from tests.test_provisioners_execution import check_bash
+from tests.test_version_pins_consumed import PIN_ENV_PATH, get_common_env_names, manifest_pin_values
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKER = ROOT / "packer"
@@ -142,17 +146,7 @@ def test_no_provisioner_seals_the_build_account_early() -> None:
 
 
 def precache_image_pins() -> dict[str, str]:
-    builds = (PACKER / "builds.pkr.hcl").read_text(encoding="utf-8")
-    manifest = json.loads((ROOT / "versions.json").read_text(encoding="utf-8"))
-    paths = dict(re.findall(r"^\s*(img_\w+)\s*=\s*local\.manifest\.([\w.]+)\s*$", builds, re.M))
-    passed = dict(re.findall(r'"(IMG_\w+)=\$\{local\.(img_\w+)\}"', builds))
-    pins: dict[str, str] = {}
-    for variable, local_var in passed.items():
-        value = manifest
-        for key in paths[local_var].split("."):
-            value = value[key]
-        pins[variable] = value
-    return pins
+    return {name: value for name, value in manifest_pin_values().items() if name.startswith("IMG_")}
 
 
 def run_precache(
@@ -217,9 +211,245 @@ def test_precache_fails_when_an_image_cannot_be_pulled(
     assert "Complete" not in result.stdout
 
 
-def test_precache_holds_no_fallback_defaults() -> None:
-    fallbacks = re.findall(r"\$\{(IMG_\w+):-", PRECACHE.read_text(encoding="utf-8"))
-    assert fallbacks == [], f"precache script still holds hardcoded fallbacks: {fallbacks}"
+_SHELL_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+_PIN_DEFAULT = re.compile(rf"\$\{{({_SHELL_NAME}):?[-=]")
+_ALIAS_ASSIGNMENT = re.compile(
+    rf'(?:^|[\s;|&()])(?P<target>{_SHELL_NAME})=(?P<quote>"?)'
+    rf"\$(?:\{{(?P<braced>{_SHELL_NAME})\}}|(?P<bare>{_SHELL_NAME}))"
+    r"(?P=quote)(?=$|[\s;|&()<>])"
+)
+
+
+def _pins_and_aliases(content: str, pins: Collection[str]) -> set[str]:
+    code = "".join(line for line in content.splitlines(keepends=True) if not line.lstrip().startswith("#"))
+    assignments = [(match["target"], match["bare"] or match["braced"]) for match in _ALIAS_ASSIGNMENT.finditer(code)]
+    names = set(pins)
+    for _ in assignments:
+        aliases = {target for target, source in assignments if source in names} - names
+        if not aliases:
+            break
+        names.update(aliases)
+    return names
+
+
+def _pin_fallbacks(provisioners: Path, pins: Collection[str]) -> list[str]:
+    findings = []
+    for script in sorted(provisioners.rglob("*")):
+        if script.is_symlink() or not script.is_file():
+            continue
+        content = script.read_text(encoding="utf-8", errors="replace")
+        names = _pins_and_aliases(content, pins)
+        findings.extend(
+            f"{script.relative_to(provisioners).as_posix()}:{number}: {line.strip()}"
+            for number, line in enumerate(content.splitlines(), 1)
+            if any(match[1] in names for match in _PIN_DEFAULT.finditer(line))
+        )
+    return findings
+
+
+def test_provisioners_hold_no_direct_pin_fallbacks(tmp_path: Path) -> None:
+    precache = tmp_path / PRECACHE.name
+    precache.write_text('echo "${IMG_PIN:-value}"\n', encoding="utf-8")
+    script = tmp_path / "52-k3s-runtime.sh"
+    cases = [
+        'echo "${PIN:-value}"',
+        'echo "${PIN-value}"',
+        'echo "${PIN:=value}"',
+        'echo "${PIN=value}"',
+        'echo "${PIN:?msg}"',
+        'echo "${PIN}"',
+        'echo "${K3S_ROLE:-agent}"',
+    ]
+    script.write_text("\n".join(cases), encoding="utf-8")
+    assert _pin_fallbacks(tmp_path, {"PIN", "IMG_PIN"}) == [
+        *(f"{script.name}:{i}: {line}" for i, line in enumerate(cases[:4], 1)),
+        f'{precache.name}:1: echo "${{IMG_PIN:-value}}"',
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "assignment", "fallback", "refused"),
+    [
+        pytest.param("helper", "", 'echo "${PIN:-value}"', True, id="extensionless"),
+        pytest.param("helper.bash", "", 'echo "${PIN:-value}"', True, id="bash-extension"),
+        pytest.param("nested/helper.sh", "", 'echo "${PIN:-value}"', True, id="nested"),
+        pytest.param("helper.sh", 'alias_pin="$PIN"; ', 'x="${alias_pin:-value}"', True, id="quoted-alias"),
+        pytest.param("helper.sh", 'local a="${PIN}"\n', 'echo "${a:=value}"', True, id="local-alias"),
+        pytest.param("helper.sh", "readonly a=$PIN\nexport b=$a\n", 'echo "${b-value}"', True, id="alias-chain"),
+        pytest.param("helper.sh", 'declare a="${PIN}"\n', 'echo "${a=value}"', True, id="declare-alias"),
+        pytest.param("helper.sh", 'x="$OTHER"; ', 'echo "${x:-value}"', False, id="non-pin-alias"),
+        pytest.param("helper.sh", 'x="${PIN:?message}"\n', 'echo "${x}"', False, id="required-read"),
+        pytest.param("helper.sh", '# a="$PIN"\n', 'echo "${a:-value}"', False, id="full-line-comment"),
+        pytest.param("helper.sh", '  # a="$PIN"\n', 'echo "${a:-value}"', False, id="indented-comment"),
+        pytest.param("helper.sh", 'a="$PIN" # note\n', 'echo "${a:-value}"', True, id="inline-comment"),
+        pytest.param("helper.sh", "#!/usr/bin/env bash\n", 'echo "${a:-value}"', False, id="shebang"),
+    ],
+)
+def test_provisioners_hold_no_pin_fallbacks(
+    tmp_path: Path, path: str, assignment: str, fallback: str, refused: bool
+) -> None:
+    script = tmp_path / path
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(assignment + fallback + "\n", encoding="utf-8")
+    line = assignment.count("\n") + 1
+    last_line = assignment.rpartition("\n")[2] + fallback
+    expected = [f"{path}:{line}: {last_line}"] if refused else []
+    assert _pin_fallbacks(tmp_path, {"PIN"}) == expected
+
+
+@pytest.mark.parametrize("entry", ["directory", "symlink"])
+def test_pin_fallback_scan_skips_nonregular_entries(tmp_path: Path, entry: str) -> None:
+    provisioners = tmp_path / "provisioners"
+    provisioners.mkdir()
+    path = provisioners / "helper.sh"
+    if entry == "directory":
+        path.mkdir()
+    else:
+        target = tmp_path / "outside.sh"
+        target.write_text('echo "${PIN:-value}"\n', encoding="utf-8")
+        try:
+            path.symlink_to(target)
+        except (NotImplementedError, OSError) as error:
+            pytest.skip(f"Cannot create fixture symlink: {error}")
+    assert _pin_fallbacks(provisioners, {"PIN"}) == []
+
+
+def test_real_provisioners_hold_no_pin_fallbacks() -> None:
+    fallbacks = _pin_fallbacks(PROVISIONERS, set(get_common_env_names()))
+    assert not fallbacks, "Provisioner pin fallbacks:\n" + "\n".join(fallbacks)
+
+
+def packer_common_env(tmp_path: Path, manifest: dict) -> subprocess.CompletedProcess[str]:
+    packer = shutil.which("packer")
+    if not packer:
+        skip_or_fail("packer is required to evaluate common_env", os.environ)
+    template = tmp_path / "packer"
+    template.mkdir()
+    builds = (PACKER / "builds.pkr.hcl").read_text(encoding="utf-8")
+    locals_blocks = re.findall(r"(?ms)^locals\s*\{\n.*?^\}", builds)
+    assert locals_blocks, "packer/builds.pkr.hcl has no locals blocks"
+    (template / "locals.pkr.hcl").write_text("\n\n".join(locals_blocks) + "\n", encoding="utf-8")
+    (tmp_path / "versions.json").write_text(json.dumps(manifest), encoding="utf-8")
+    shutil.copyfile(PIN_ENV_PATH, template / PIN_ENV_PATH.name)
+    return subprocess.run(
+        [packer, "console", str(template)],
+        input="jsonencode(local.common_env)\n",
+        text=True,
+        capture_output=True,
+        timeout=COMMAND_TIMEOUT_S,
+        check=False,
+    )
+
+
+def test_packer_common_env_matches_manifest_pins(tmp_path: Path) -> None:
+    manifest = json.loads((ROOT / "versions.json").read_text(encoding="utf-8"))
+    result = packer_common_env(tmp_path, manifest)
+    assert result.returncode == 0, result.stderr
+    expected = sorted(f"{name}={value}" for name, value in manifest_pin_values().items())
+    assert sorted(json.loads(result.stdout)) == expected
+
+
+def test_packer_common_env_refuses_missing_manifest_pin(tmp_path: Path) -> None:
+    manifest = json.loads((ROOT / "versions.json").read_text(encoding="utf-8"))
+    del manifest["k3s"]["version"]
+    result = packer_common_env(tmp_path, manifest)
+    assert result.returncode != 0, result.stdout
+    assert "common_env" in result.stdout + result.stderr
+
+
+_HCL_OPAQUE = re.compile(r'"(?:\\[^\n]|[^"\\\n])*"|#[^\n]*|//[^\n]*|/\*.*?\*/|(?P<unreadable>"|/\*|<<)', re.S)
+_COMMON_ENV = re.compile(r"(?<![\w.-])local\s*\.\s*common_env(?![\w-])")
+
+
+def _hcl_layout(content: str) -> str:
+    def mask(token: re.Match[str]) -> str:
+        assert not token["unreadable"], f"unreadable HCL at offset {token.start()}: {token[0]!r}"
+        return re.sub(r"[^\n]", " ", token[0])
+
+    return _HCL_OPAQUE.sub(mask, content)
+
+
+def _hcl_blocks(content: str, header: str) -> list[str]:
+    depth = 0
+    start = None
+    blocks = []
+    for brace in re.finditer(r"[{}]", _hcl_layout(content)):
+        if brace[0] == "{":
+            if depth == 0:
+                line_start = content.rfind("\n", 0, brace.start()) + 1
+                label = content[line_start : brace.start()].strip()
+                start = brace.end() if re.fullmatch(header, label) else None
+            depth += 1
+        else:
+            depth -= 1
+            assert depth >= 0, f"unmatched HCL closing brace at offset {brace.start()}"
+            if depth == 0 and start is not None:
+                blocks.append(content[start : brace.start()])
+    assert depth == 0, f"unclosed HCL block while reading {header}"
+    return blocks
+
+
+def _hcl_environment_expression(shell: str) -> str:
+    layout = _hcl_layout(shell)
+    assert (attribute := re.search(r"(?m)^[ \t]*environment_vars[ \t]*=[ \t]*", layout)), (
+        "no environment_vars attribute"
+    )
+    expression = layout[attribute.end() :]
+    depth = 0
+    for token in re.finditer(r"[({\[)}\]\n]", expression):
+        if token[0] in "([{":
+            depth += 1
+        elif token[0] in ")]}":
+            depth -= 1
+        elif depth == 0:
+            return expression[: token.start()]
+        assert depth >= 0, "unbalanced environment_vars expression"
+    assert depth == 0, "unbalanced environment_vars expression"
+    return expression
+
+
+def _assert_build_common_env(content: str) -> set[str]:
+    names = set()
+    for build in _hcl_blocks(content, r"build"):
+        name = json.loads(hcl_attribute(build, "name"))
+        assert isinstance(name, str) and name and name not in names, f"invalid or duplicate build name: {name!r}"
+        names.add(name)
+        shells = _hcl_blocks(build, r'provisioner[ \t]+"shell"')
+        assert shells, f"{name}: no shell provisioner"
+        for index, shell in enumerate(shells, 1):
+            try:
+                assert _COMMON_ENV.search(_hcl_environment_expression(shell)), "environment_vars omits local.common_env"
+            except AssertionError as error:
+                raise AssertionError(f"{name}: shell provisioner {index}: {error}") from error
+    return names
+
+
+def test_every_packer_build_wires_common_env() -> None:
+    actual = _assert_build_common_env((PACKER / "builds.pkr.hcl").read_text(encoding="utf-8"))
+    expected = {block.flavor for block in _apply_blocks(GOLDEN.read_text(encoding="utf-8"))}
+    assert len(expected) == 44
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "diagnostic"),
+    [
+        pytest.param(
+            'provisioner "shell" {\n    environment_vars = ["local.common_env"] # local.common_env\n  }',
+            "planted: shell provisioner 1: environment_vars omits local.common_env",
+            id="missing-common-env",
+        ),
+        pytest.param('provisioner "file" {}', "planted: no shell provisioner", id="no-shell"),
+        pytest.param(
+            'provisioner "shell" {\n    environment_vars = local.common_env',
+            "unclosed HCL block",
+            id="unclosed-block",
+        ),
+    ],
+)
+def test_build_common_env_refuses_bad_wiring(body: str, diagnostic: str) -> None:
+    with pytest.raises(AssertionError, match=re.escape(diagnostic)):
+        _assert_build_common_env(f'build {{\n  name = "planted"\n  {body}\n}}\n')
 
 
 def test_every_image_read_by_precache_is_passed_by_build() -> None:

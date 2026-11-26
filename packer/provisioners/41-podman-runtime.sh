@@ -2,11 +2,11 @@
 # Copyright 2026 Lusoris
 # 41-podman-runtime.sh — Install Podman 5.x, Buildah, Skopeo, and Quadlet systemd support
 # Configures daemonless, rootless container stack with automated Quadlet generators.
+# Consumes CRUN_VERSION and CDEBUG_VERSION from versions.json.
 # Complies with NASA/JPL Power of 10: short functions (<= 60 lines), checked returns.
 set -euo pipefail
 
-CDEBUG_VERSION="${CDEBUG_VERSION:-0.0.19}"
-CRUN_VERSION="${CRUN_VERSION:?CRUN_VERSION must come from versions.json}"
+: "${CRUN_VERSION:?CRUN_VERSION must come from versions.json}"
 
 install_podman_packages() {
   echo "==> Installing Podman, Buildah, Skopeo, Netavark, and crun on Ubuntu 26.04..."
@@ -50,7 +50,7 @@ configure_quadlet_and_rootless() {
 }
 
 install_cdebug() {
-  local version="${CDEBUG_VERSION:-0.0.19}"
+  local version="${CDEBUG_VERSION:?CDEBUG_VERSION must come from versions.json}"
   local arch
   arch=$(uname -m)
   case "${arch}" in

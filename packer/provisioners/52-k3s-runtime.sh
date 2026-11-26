@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Copyright 2026 Lusoris
 # 52-k3s-runtime.sh — Install K3s lightweight Kubernetes engine for edge & homelabs
-# Consumes K3S_VERSION and K3S_ROLE injected dynamically from versions.json.
+# Consumes K3S_VERSION from versions.json and K3S_ROLE from the build flavor.
 # Complies with NASA/JPL Power of 10: short functions (<= 60 lines), checked returns.
 set -euo pipefail
 
-K3S_VERSION="${K3S_VERSION:-v1.36.4+k3s1}"
+k3s_version="${K3S_VERSION:?K3S_VERSION must come from versions.json}"
 K3S_ROLE="${K3S_ROLE:-agent}"
 
 setup_k3s_prerequisites() {
@@ -25,7 +25,7 @@ setup_k3s_prerequisites() {
 }
 
 install_k3s_binaries() {
-  echo "==> Installing K3s ${K3S_VERSION} (${K3S_ROLE} role)..."
+  echo "==> Installing K3s ${k3s_version} (${K3S_ROLE} role)..."
   local install_script
   install_script=$(mktemp)
 
@@ -37,14 +37,14 @@ install_k3s_binaries() {
   if [ "${K3S_ROLE}" = "server" ]; then
     INSTALL_K3S_SKIP_ENABLE=true \
       INSTALL_K3S_SKIP_START=true \
-      INSTALL_K3S_VERSION="${K3S_VERSION}" \
-      sh "${install_script}"
+      INSTALL_K3S_VERSION="${k3s_version}" \
+      sh -- "${install_script}"
   else
     INSTALL_K3S_SKIP_ENABLE=true \
       INSTALL_K3S_SKIP_START=true \
-      INSTALL_K3S_VERSION="${K3S_VERSION}" \
+      INSTALL_K3S_VERSION="${k3s_version}" \
       INSTALL_K3S_EXEC="agent" \
-      sh "${install_script}"
+      sh -- "${install_script}"
   fi
 
   rm -f "${install_script}"
@@ -86,7 +86,7 @@ main() {
   install_k3s_binaries
   configure_k3s_defaults
   verify_k3s_unit_disabled
-  echo "==> 52-k3s-runtime: K3s ${K3S_VERSION} installation complete (${K3S_ROLE})."
+  echo "==> 52-k3s-runtime: K3s ${k3s_version} installation complete (${K3S_ROLE})."
 }
 
 main "$@"

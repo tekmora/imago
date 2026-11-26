@@ -3,20 +3,21 @@
 # 32-gpu-amd-rocm.sh — AMD ROCm compute runtime for AI/ML and GPU acceleration
 # Configures the AMD ROCm apt repository, HIP runtime, and /dev/kfd CDI specs.
 # Version, repository root and apt suite come from versions.json (drivers.amd).
+# DISTRO_RELEASE comes from versions.json (distro.release).
 # Complies with NASA/JPL Power of 10: short functions (<= 60 lines), checked returns.
 set -euo pipefail
 
 : "${ROCM_VERSION:?ROCM_VERSION must come from versions.json}"
 : "${ROCM_REPO:?ROCM_REPO must come from versions.json}"
 : "${ROCM_APT_SUITE:?ROCM_APT_SUITE must come from versions.json}"
-DISTRO_RELEASE="${DISTRO_RELEASE:-resolute}"
+ubuntu_release="${DISTRO_RELEASE:?DISTRO_RELEASE must come from versions.json}"
 
 setup_rocm_repository() {
   echo "==> Configuring AMD ROCm apt repository (v${ROCM_VERSION}, suite ${ROCM_APT_SUITE})..."
   # AMD publishes ROCm for jammy and noble only. On another release the image uses the
   # suite from versions.json and says so, instead of a suite AMD does not publish.
-  if [ "${ROCM_APT_SUITE}" != "${DISTRO_RELEASE}" ]; then
-    echo "    Note: Ubuntu ${DISTRO_RELEASE} uses the ROCm ${ROCM_APT_SUITE} packages."
+  if [ "${ROCM_APT_SUITE}" != "${ubuntu_release}" ]; then
+    echo "    Note: Ubuntu ${ubuntu_release} uses the ROCm ${ROCM_APT_SUITE} packages."
   fi
   sudo mkdir -p -m 755 /etc/apt/keyrings
   curl -fsSL --max-time 30 "${ROCM_REPO}/rocm.gpg.key" |

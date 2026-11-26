@@ -20,6 +20,10 @@ go: &go
   - 'go.sum'
   - 'cmd/**'
   - 'pkg/**'
+  - 'schema.go'
+  - 'versions.schema.json'
+  - 'versions.json'
+  - 'packer/pin-env.json'
 python: &python
   - 'tests/**'
   - '**/*.py'
@@ -63,6 +67,11 @@ test-python:
   - *shell
   - *workflows
   - '.github/requirements/**'
+  - 'CHANGELOG.md'
+  - 'renovate.json'
+  - '.needs.yaml'
+  - 'go.mod'
+  - 'tools/govulncheck/go.mod'
 docs-strict:
   - *docs
   - *workflows
@@ -72,6 +81,8 @@ semgrep: &scan-code
   - 'packer/**'
   - 'tests/**'
   - 'versions.json'
+  - 'renovate.json'
+  - '.needs.yaml'
   - 'Makefile'
   - 'pyproject.toml'
   - 'go.mod'

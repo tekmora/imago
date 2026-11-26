@@ -65,11 +65,11 @@ overrides:
         slsa_level: 3
         enforce_cosign: true
         require_sbom: true
-    # release-please opens the release pull request with GITHUB_TOKEN (issue #45); the online
-    # audit fails when the forge withdraws the capability, before a release run can.
+    # The repository and organisation both set this to false. The workflow token cannot
+    # open the release pull request. Issue #256 moves release-please to the release app.
     actions:
         default_workflow_permissions: read
-        allow_create_and_approve_pull_requests: true
+        allow_create_and_approve_pull_requests: false
     ci:
         diff_aware_filtering: true
         skip_heavy_gates_on_docs_or_state: true
@@ -89,9 +89,9 @@ exceptions:
     - rule: codespell
       path: tools/figures/player/player.js
       category: C
-      reason: minified third-party interfig bundle
-      entered: "2026-10-25"
-      expires: "2026-11-04"
+      reason: "minified third-party interfig bundle the engine emits (ledger engine-emitted-player-lint-20261018); codespell reads mangled identifiers (ue, ot, Bu, Fo) as typos; renewed 2026-11-25 after the 2026-11-23 expiry"
+      entered: "2026-11-25"
+      expires: "2026-12-05"
     - rule: backlog.caps.forge_alerts
       tool: backlog
       category: A

@@ -34,7 +34,7 @@
   "repo_distributed_status": "Met",
   "repo_distributed_justification": "The project uses Git, a widely adopted distributed version control system hosted on GitHub. Evidence: https://github.com/cordanaLLM/imago/blob/main/README.md#L167-L169 https://github.com/cordanaLLM/imago/blob/main/CONTRIBUTING.md#L9-L17",
   "version_unique_status": "Unmet",
-  "version_unique_justification": "No release published yet (0.x); release-please is configured in release-please-config.json and VERSION defines initial-version 0.1.0 to assign unique versions upon release, but no official release has been published yet. Evidence: https://github.com/cordanaLLM/imago/blob/main/VERSION https://github.com/cordanaLLM/imago/blob/main/release-please-config.json",
+  "version_unique_justification": "No release has been published yet. The release-please configuration sets initial-version to 0.1.0 and uses VERSION as the version file. Evidence: https://github.com/cordanaLLM/imago/blob/main/VERSION https://github.com/cordanaLLM/imago/blob/main/release-please-config.json",
   "version_semver_status": "Met",
   "version_semver_justification": "The project uses Semantic Versioning 2.0.0: the VERSION file is checked for the X.Y.Z form by tests, and release-please derives versions from Conventional Commits; no release has been published yet (0.x). Evidence: https://github.com/cordanaLLM/imago/blob/main/CHANGELOG.md#L5-L6 https://github.com/cordanaLLM/imago/blob/main/release-please-config.json https://github.com/cordanaLLM/imago/blob/main/tests/test_governance.py#L79-L87",
   "version_tags_status": "Unmet",

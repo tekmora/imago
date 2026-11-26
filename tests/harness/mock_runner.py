@@ -293,6 +293,12 @@ modprobe() {
 }
 export -f modprobe
 
+nvidia-ctk() {
+  echo "nvidia-ctk $*" >> "$SANDBOX_ROOT/journal_cmds.log"
+  mock_status nvidia-ctk
+}
+export -f nvidia-ctk
+
 containerd() {
   echo "containerd $*" >> "$SANDBOX_ROOT/journal_cmds.log"
   if [ "$1" = "config" ] && [ "$2" = "default" ]; then

@@ -15,6 +15,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = REPO_ROOT / "versions.json"
 SCHEMA_PATH = REPO_ROOT / "versions.schema.json"
+MAPPED_PINS = json.loads((REPO_ROOT / "packer" / "pin-env.json").read_text(encoding="utf-8"))
 
 
 def load_manifest():
@@ -23,6 +24,19 @@ def load_manifest():
 
 def load_schema():
     return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(("name", "key_path"), MAPPED_PINS.items(), ids=list(MAPPED_PINS))
+def test_schema_rejects_empty_mapped_pin(name: str, key_path: str) -> None:
+    data = load_manifest()
+    keys = key_path.split(".")
+    parent = data
+    for key in keys[:-1]:
+        parent = parent[key]
+    parent[keys[-1]] = ""
+    with pytest.raises(jsonschema.ValidationError) as error:
+        jsonschema.validate(instance=data, schema=load_schema())
+    assert ".".join(error.value.absolute_path) == key_path, name
 
 
 class TestManifestIntegrity:

@@ -65,7 +65,7 @@
           "required": ["rocm_legacy_version", "rocm_bleeding_version", "rocm_repo", "rocm_apt_suite", "k8s_plugin"],
           "properties": {
             "rocm_legacy_version": { "type": "string" },
-            "rocm_bleeding_version": { "type": "string" },
+            "rocm_bleeding_version": { "type": "string", "minLength": 1 },
             "rocm_repo": { "type": "string", "pattern": "^https://[^\\s]+[^/]$" },
             "rocm_apt_suite": { "type": "string", "pattern": "^[a-z]+$" },
             "k8s_plugin": { "$ref": "#/$defs/imageRef" }
@@ -87,15 +87,15 @@
             "k8s_plugin"
           ],
           "properties": {
-            "legacy_driver": { "type": "string" },
-            "mainstream_driver": { "type": "string" },
-            "modern_driver": { "type": "string" },
-            "bleeding_driver": { "type": "string" },
-            "datacenter_driver": { "type": "string" },
-            "cuda_legacy": { "type": "string" },
-            "cuda_mainstream": { "type": "string" },
-            "cuda_modern": { "type": "string" },
-            "cuda_bleeding": { "type": "string" },
+            "legacy_driver": { "type": "string", "minLength": 1 },
+            "mainstream_driver": { "type": "string", "minLength": 1 },
+            "modern_driver": { "type": "string", "minLength": 1 },
+            "bleeding_driver": { "type": "string", "minLength": 1 },
+            "datacenter_driver": { "type": "string", "minLength": 1 },
+            "cuda_legacy": { "type": "string", "minLength": 1 },
+            "cuda_mainstream": { "type": "string", "minLength": 1 },
+            "cuda_modern": { "type": "string", "minLength": 1 },
+            "cuda_bleeding": { "type": "string", "minLength": 1 },
             "container_toolkit": { "type": "string" },
             "k8s_plugin": { "$ref": "#/$defs/imageRef" }
           }
@@ -106,7 +106,7 @@
       "type": "object",
       "required": ["version"],
       "properties": {
-        "version": { "type": "string" }
+        "version": { "type": "string", "minLength": 1 }
       }
     },
     "runtimes": {
@@ -115,16 +115,16 @@
       "properties": {
         "containerd": { "type": "string" },
         "docker_ce": { "type": "string" },
-        "crun": { "type": "string" },
-        "stargz_snapshotter": { "type": "string" }
+        "crun": { "type": "string", "minLength": 1 },
+        "stargz_snapshotter": { "type": "string", "minLength": 1 }
       }
     },
     "tools": {
       "type": "object",
       "properties": {
-        "cdebug": { "type": "string" },
-        "container_structure_test": { "type": "string" },
-        "enroot": { "type": "string" }
+        "cdebug": { "type": "string", "minLength": 1 },
+        "container_structure_test": { "type": "string", "minLength": 1 },
+        "enroot": { "type": "string", "minLength": 1 }
       }
     },
     "build": {

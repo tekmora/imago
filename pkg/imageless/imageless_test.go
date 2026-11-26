@@ -2,6 +2,9 @@
 package imageless_test
 
 import (
+	"encoding/json/v2"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,8 +15,8 @@ import (
 
 func TestGenerateApplyScript(t *testing.T) {
 	opts := imageless.ApplyOptions{
-		FlavorID: "docker-generic",
-		DryRun:   false,
+		FlavorID:     "docker-generic",
+		VersionsPath: versionsFile,
 	}
 
 	script, err := imageless.GenerateApplyScript(opts)
@@ -25,6 +28,7 @@ func TestGenerateApplyScript(t *testing.T) {
 }
 
 func TestGenerateApplyScriptDryRun(t *testing.T) {
+	t.Chdir(t.TempDir())
 	opts := imageless.ApplyOptions{
 		FlavorID: "base-generic",
 		DryRun:   true,
@@ -35,6 +39,62 @@ func TestGenerateApplyScriptDryRun(t *testing.T) {
 
 	assert.Contains(t, script, "DRY-RUN")
 	assert.Contains(t, script, "[SIMULATED] 00-base-strip.sh")
+}
+
+func TestGenerateApplyScriptRejectsMissingManifest(t *testing.T) {
+	t.Chdir(t.TempDir())
+	script, err := imageless.GenerateApplyScript(imageless.ApplyOptions{FlavorID: "base-generic"})
+	require.ErrorContains(t, err, "read versions.json")
+	assert.Empty(t, script)
+}
+
+func readVersionsDocument(t *testing.T) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(versionsFile)
+	require.NoError(t, err)
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(data, &document))
+	return document
+}
+
+func writeVersionsDocument(t *testing.T, document map[string]any) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "versions.json")
+	data, err := json.Marshal(document)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	return path
+}
+
+func TestGenerateApplyScriptRejectsInvalidManifestPins(t *testing.T) {
+	t.Run("missing mapped key", func(t *testing.T) {
+		document := readVersionsDocument(t)
+		delete(document["tools"].(map[string]any), "enroot")
+		path := writeVersionsDocument(t, document)
+		script, err := imageless.GenerateApplyScript(imageless.ApplyOptions{FlavorID: "base-generic", VersionsPath: path})
+		require.ErrorContains(t, err, path)
+		require.ErrorContains(t, err, "tools.enroot (ENROOT_VERSION)")
+		require.Empty(t, script)
+	})
+	t.Run("non-string manifest pin", func(t *testing.T) {
+		document := readVersionsDocument(t)
+		document["tools"].(map[string]any)["enroot"] = false
+		path := writeVersionsDocument(t, document)
+		script, err := imageless.GenerateApplyScript(imageless.ApplyOptions{FlavorID: "base-generic", VersionsPath: path})
+		require.ErrorContains(t, err, path)
+		require.ErrorContains(t, err, "enroot")
+		require.Empty(t, script)
+	})
+}
+
+func TestGenerateApplyScriptQuotesManifestPins(t *testing.T) {
+	document := readVersionsDocument(t)
+	document["tools"].(map[string]any)["cdebug"] = "one'$name\ntwo"
+	path := writeVersionsDocument(t, document)
+	script, err := imageless.GenerateApplyScript(imageless.ApplyOptions{FlavorID: "base-generic", VersionsPath: path})
+	require.NoError(t, err)
+	require.Contains(t, script, "export CDEBUG_VERSION='one'\\''$name\ntwo'\n")
+	require.Contains(t, maskApplyPinValues(t, script, pinEnvMapping(t)), "export CDEBUG_VERSION='tools.cdebug'\n")
 }
 
 func TestGenerateBootCommand(t *testing.T) {

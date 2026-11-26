@@ -41,7 +41,7 @@ Across the reference repositories, the stable architectural pattern is:
 | **Trunk-Based PR Merge Flow** | **Adopted** | Protected `main`, branch protection requiring `required-checks`, squash/rebase only |
 | **Pinned GitHub Actions** | **Adopted** | All 26 actions in `.github/workflows/` pinned to 40-character commit SHAs |
 | **Conventional Commits** | **Adopted** | `type(scope): subject` syntax enforced via PR titles and release automation |
-| **Semantic Versioning (Release Please)** | **Adopted** | Automated releases, CHANGELOG generation, and release pull requests |
+| **Semantic Versioning (Release Please)** | **Adopted** | `release-please` is configured. Opening a new release pull request and merging #58 wait for the release app migration in issue #256. The [release procedure](operations/maintenance-cadence.md#31-tasks-procedures) checks the published assets and signed checksums. |
 | **Append-Only ADRs** | **Adopted** | [`docs/adr/`](adr/README.md) following standardized format |
 | **Material for MkDocs Portal** | **Adopted** | `mkdocs build --strict` deploying to GitHub Pages via [`pages.yml`](https://github.com/cordanaLLM/imago/blob/main/.github/workflows/pages.yml) |
 | **Privacy & Zero-Leak Invariant** | **Adopted** | Strict prohibition on RFC 1918 IPs and `/home/*` paths (`test_no_private_ips_or_user_paths`) |
@@ -56,6 +56,16 @@ Across the reference repositories, the stable architectural pattern is:
 | **Declarative Epics & Milestones** | **Adopted** | `.github/epics.json`, `.github/milestones.json`, and automated PR hard gate (`pr-project-gate.yml`) |
 | **Universal Architecture & Survey** | **Adopted** | `x86_64`, `arm64` (RPi 5/Rockchip/Apple Silicon), `riscv64`, 2 Datacenter Tiers, and recurring sync cadences |
 
+### Changelog Lint Exceptions
+
+Place `<!-- lint-exception: rule MD024, category A, entered YYYY-MM-DD, expires YYYY-MM-DD, issue 123: reason -->`
+immediately above the standalone `markdownlint-disable-next-line` directive and use the same rule list in both.
+The Changelog reserves the keyword `markdownlint` (any case) for standalone directives in that exact form.
+For category A, the entire reason must match `interval <N> day[s]; <text>` or
+`interval to <YYYY-MM-DD>; <text>`. Use a positive integer without leading zeroes for `N` and non-blank text,
+for example `interval 10 days; Preserve the released heading`. The expiry must be on or before the entry date
+plus the stated days or the stated date, respectively.
+
 ---
 
 ## 4. Host Controls Verified on GitHub
@@ -64,6 +74,6 @@ The following repository settings were verified via `gh api`:
 
 - **Visibility & Metadata**: Public repository, description set, topics registered, homepage set to `https://cordanallm.github.io/imago`.
 - **Merge Settings**: Squash and rebase merges allowed; merge commits disabled; delete branch on merge enabled.
-- **Workflow Permissions**: default token permission `read` and `can_approve_pull_request_reviews: true` to enable Release Please automation. `.standards.yaml` declares both under `overrides.actions`, and the online `praetorctl audit` (run by `make verify-all` and the pre-push hook) fails when the forge value differs, naming whether the repository or the organisation changed it (issue #45).
+- **Workflow Permissions**. The repository and the `tekmora` organisation both have live default workflow permissions of `read` and `can_approve_pull_request_reviews: false`. The workflow token cannot open the release pull request. Issue #256 tracks the move to the release app. `.standards.yaml` declares both settings under `overrides.actions`, and the online `praetorctl audit` (run by `make verify-all` and the pre-push hook) fails when either value drifts, naming the affected repository or organisation.
 - **Branch Protection on `main`**: Required status checks as listed in `.github/rulesets/main.json`, the `required-checks` aggregator among them (ADR-0027); strict linear history; force-pushes and deletions blocked.
 - **Project Tracking**: GitHub Project V2 [`imago Roadmap`](https://github.com/users/lusoris/projects/1) tracking active epics.

@@ -12,12 +12,51 @@ import pytest
 
 from tests.harness.live import skip_or_fail
 from tests.harness.mock_runner import GIT_BASH, MockSandbox
+from tests.test_version_pins_consumed import manifest_pin_values
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ROCM_ENV = {"ROCM_VERSION": "7.2.4", "ROCM_REPO": "https://repo.example.com/rocm", "ROCM_APT_SUITE": "noble"}
-K8S_ENV = {"CDEBUG_VERSION": "0.0.0", "K8S_VERSION": "1.37.0", "CRUN_VERSION": "1.20"}
-PODMAN_ENV = {"CDEBUG_VERSION": "0.0.0", "CRUN_VERSION": "1.20"}
 PROVISIONERS_DIR = REPO_ROOT / "packer" / "provisioners"
+MANIFEST_PINS = manifest_pin_values()
+
+
+def pin_env(*names: str) -> dict[str, str]:
+    return {name: MANIFEST_PINS[name] for name in names}
+
+
+ROCM_ENV = pin_env("DISTRO_RELEASE", "ROCM_VERSION", "ROCM_REPO", "ROCM_APT_SUITE")
+DOCKER_ENV = pin_env("DISTRO_RELEASE", "CDEBUG_VERSION")
+K8S_ENV = pin_env("CDEBUG_VERSION", "K8S_MAJOR_MINOR", "K8S_VERSION", "CRUN_VERSION", "IMG_PAUSE")
+K3S_ENV = pin_env("K3S_VERSION")
+PODMAN_ENV = pin_env("CDEBUG_VERSION", "CRUN_VERSION")
+STARGZ_ENV = pin_env("STARGZ_VERSION")
+ENROOT_ENV = pin_env("ENROOT_VERSION")
+CST_ENV = pin_env("CST_VERSION")
+NVIDIA_ENV = {
+    "33-gpu-nvidia-legacy.sh": pin_env("NVIDIA_LEGACY_DRIVER", "CUDA_LEGACY"),
+    "34-gpu-nvidia-mainstream.sh": pin_env("NVIDIA_MAINSTREAM_DRIVER", "CUDA_MAINSTREAM"),
+}
+
+
+def test_fixture_pins_match_versions_manifest() -> None:
+    pins = manifest_pin_values()
+    fixtures = {
+        "ROCM_ENV": ROCM_ENV,
+        "DOCKER_ENV": DOCKER_ENV,
+        "K8S_ENV": K8S_ENV,
+        "K3S_ENV": K3S_ENV,
+        "PODMAN_ENV": PODMAN_ENV,
+        "STARGZ_ENV": STARGZ_ENV,
+        "ENROOT_ENV": ENROOT_ENV,
+        "CST_ENV": CST_ENV,
+        **NVIDIA_ENV,
+    }
+    mismatches = [
+        f"{fixture}.{name}: {value!r} != {pins[name]!r}"
+        for fixture, env in fixtures.items()
+        for name, value in env.items()
+        if value != pins[name]
+    ]
+    assert not mismatches, "\n".join(mismatches)
 
 
 def check_bash(bash: Path | None) -> None:
@@ -29,6 +68,20 @@ def check_bash(bash: Path | None) -> None:
 @pytest.fixture
 def require_bash():
     check_bash(GIT_BASH)
+
+
+@pytest.fixture
+def nvidia_ctk_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Stand in for a host executable and leave a marker beyond the sandbox if called."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "nvidia-ctk"
+    executable.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "$MOCK_CTK_HOST_WRITE"\n', encoding="utf-8")
+    executable.chmod(0o755)
+    marker = tmp_path / "nvidia-ctk-host-write"
+    monkeypatch.setenv("PATH", str(bin_dir), prepend=os.pathsep)
+    monkeypatch.setenv("MOCK_CTK_HOST_WRITE", marker.as_posix())
+    return marker
 
 
 class TestProvisionersExecution:
@@ -107,12 +160,50 @@ class TestProvisionersExecution:
         assert unset in res.stderr
         assert not res.find_commands("curl")
 
+    @pytest.mark.parametrize(("script", "env"), sorted(NVIDIA_ENV.items()))
+    def test_nvidia_driver_branch_logs_its_cuda_label(
+        self, tmp_path: Path, require_bash, nvidia_ctk_on_path: Path, script: str, env: dict[str, str]
+    ) -> None:
+        """The legacy and mainstream branches read their CUDA pin and log it with the driver branch."""
+        res = MockSandbox(tmp_path).run_script(PROVISIONERS_DIR / script, env_vars=env)
+        assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
+        branch = next(value for name, value in env.items() if name.startswith("NVIDIA_"))
+        cuda = next(value for name, value in env.items() if name.startswith("CUDA_"))
+        assert f"branch {branch} (CUDA {cuda})" in res.stdout
+        assert res.find_commands("nvidia-ctk") == ["nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"]
+
+    @pytest.mark.parametrize(("script", "env"), sorted(NVIDIA_ENV.items()))
+    def test_nvidia_cdi_failure_warns_without_running_the_path_executable(
+        self, tmp_path: Path, require_bash, nvidia_ctk_on_path: Path, script: str, env: dict[str, str]
+    ) -> None:
+        """An executable on PATH cannot escape the sandbox, even when the mock fails."""
+        res = MockSandbox(tmp_path).run_script(PROVISIONERS_DIR / script, env_vars={**env, "MOCK_FAIL": "nvidia-ctk"})
+
+        assert not nvidia_ctk_on_path.exists(), "The executable on PATH wrote outside the sandbox"
+        assert res.find_commands("nvidia-ctk") == ["nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"]
+        assert "nvidia-ctk cdi generate returned non-zero" in res.stderr
+        assert res.returncode == 0, res.stderr
+
+    @pytest.mark.parametrize(
+        ("script", "unset"), [(script, name) for script, env in sorted(NVIDIA_ENV.items()) for name in sorted(env)]
+    )
+    def test_nvidia_driver_branch_refuses_a_missing_pin(
+        self, tmp_path: Path, require_bash, script: str, unset: str
+    ) -> None:
+        """Without a versions.json value the script stops before it configures a repository."""
+        env = {**NVIDIA_ENV[script], unset: ""}
+        res = MockSandbox(tmp_path).run_script(PROVISIONERS_DIR / script, env_vars=env)
+        assert res.returncode != 0
+        assert unset in res.stderr
+        assert not res.find_commands("curl")
+        assert not res.find_commands("apt-get")
+
     def test_40_docker_runtime_execution(self, tmp_path: Path, require_bash) -> None:
         """Verify 40-docker-runtime.sh generates daemon.json and uses dynamic arch."""
         sandbox = MockSandbox(tmp_path, arch="amd64")
         script = PROVISIONERS_DIR / "40-docker-runtime.sh"
 
-        res = sandbox.run_script(script)
+        res = sandbox.run_script(script, env_vars=DOCKER_ENV)
         assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
 
         daemon_json = res.read_file("etc/docker/daemon.json")
@@ -128,6 +219,23 @@ class TestProvisionersExecution:
         assert unset in res.stderr
         assert not res.find_commands("apt-get")
 
+    @pytest.mark.parametrize(
+        ("script", "env", "unset"),
+        [
+            pytest.param("40-docker-runtime.sh", DOCKER_ENV, "DISTRO_RELEASE", id="docker-release"),
+            pytest.param("40-docker-runtime.sh", DOCKER_ENV, "CDEBUG_VERSION", id="docker-cdebug"),
+            pytest.param("41-podman-runtime.sh", PODMAN_ENV, "CDEBUG_VERSION", id="podman-cdebug"),
+            pytest.param("52-k3s-runtime.sh", K3S_ENV, "K3S_VERSION", id="k3s-version"),
+        ],
+    )
+    @pytest.mark.usefixtures("require_bash")
+    def test_container_runtimes_refuse_missing_pins(
+        self, tmp_path: Path, script: str, env: dict[str, str], unset: str
+    ) -> None:
+        res = MockSandbox(tmp_path).run_script(PROVISIONERS_DIR / script, env_vars={**env, unset: ""})
+        assert res.returncode != 0
+        assert f"{unset} must come from versions.json" in res.stderr
+
     def test_50_k8s_runtime_pins_the_kubernetes_patch_release(self, tmp_path: Path, require_bash) -> None:
         """kubelet, kubeadm and kubectl install at the K8S_VERSION patch release, not the channel head."""
         res = MockSandbox(tmp_path).run_script(PROVISIONERS_DIR / "50-k8s-runtime.sh", env_vars=K8S_ENV)
@@ -135,24 +243,26 @@ class TestProvisionersExecution:
         installs = [cmd for cmd in res.find_commands("apt-get") if "kubeadm" in cmd]
         assert len(installs) == 1
         for package in ("kubelet", "kubeadm", "kubectl"):
-            assert f"{package}=1.37.0-*" in installs[0]
+            assert f"{package}={K8S_ENV['K8S_VERSION']}-*" in installs[0]
 
     @pytest.mark.parametrize(
         ("script", "env"),
         [("50-k8s-runtime.sh", K8S_ENV), ("41-podman-runtime.sh", PODMAN_ENV)],
     )
-    @pytest.mark.parametrize(("archive", "accepted"), [("1.19.2-1", False), ("1.20", True), ("1.21-1ubuntu3", True)])
+    @pytest.mark.parametrize("relation", ["older", "equal", "newer"])
     @pytest.mark.usefixtures("require_bash")
     def test_crun_archive_release_meets_the_pin(
-        self, tmp_path: Path, script: str, env: dict[str, str], archive: str, accepted: bool
+        self, tmp_path: Path, script: str, env: dict[str, str], relation: str
     ) -> None:
         """An archive crun older than CRUN_VERSION fails the build; the pin itself and newer pass."""
+        pin = env["CRUN_VERSION"]
+        archive = {"older": f"0~{pin}", "equal": pin, "newer": f"{pin}+test"}[relation]
         res = MockSandbox(tmp_path).run_script(
             PROVISIONERS_DIR / script, env_vars={**env, "MOCK_CRUN_VERSION": archive}
         )
-        assert (res.returncode == 0) is accepted, res.stderr
-        if not accepted:
-            assert f"crun {archive} from the archive is older than the pinned 1.20" in res.stderr
+        assert (res.returncode == 0) == (relation != "older"), res.stderr
+        if relation == "older":
+            assert f"crun {archive} from the archive is older than the pinned {pin}" in res.stderr
 
     def test_50_k8s_runtime_containerd2_cri(self, tmp_path: Path, require_bash) -> None:
         """Verify 50-k8s-runtime.sh generates containerd 2.x CRI runtime schema with crun."""
@@ -172,7 +282,7 @@ class TestProvisionersExecution:
         sandbox = MockSandbox(tmp_path)
         script = PROVISIONERS_DIR / "51-stargz-snapshotter.sh"
 
-        res = sandbox.run_script(script, env_vars={"STARGZ_VERSION": "0.18.2"})
+        res = sandbox.run_script(script, env_vars=STARGZ_ENV)
         assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
 
         # containerd config has proxy plugin block
@@ -195,7 +305,7 @@ class TestProvisionersExecution:
         assert any("enable" in cmd and "stargz-snapshotter" in cmd for cmd in sys_cmds)
 
         # Idempotency check: second run should not duplicate the proxy plugin block
-        res2 = sandbox.run_script(script, env_vars={"STARGZ_VERSION": "0.18.2"})
+        res2 = sandbox.run_script(script, env_vars=STARGZ_ENV)
         assert res2.returncode == 0
         containerd_conf2 = res2.read_file("etc/containerd/config.toml")
         assert containerd_conf2.count("[proxy_plugins.stargz]") == 1
@@ -205,7 +315,7 @@ class TestProvisionersExecution:
         sandbox = MockSandbox(tmp_path)
         script = PROVISIONERS_DIR / "51-stargz-snapshotter.sh"
 
-        res = sandbox.run_script(script, env_vars={"STARGZ_VERSION": "0.18.2", "MOCK_MISMATCH_SHA": "1"})
+        res = sandbox.run_script(script, env_vars={**STARGZ_ENV, "MOCK_MISMATCH_SHA": "1"})
         assert res.returncode != 0
         assert "Checksum verification failed" in res.stderr
         assert res.read_file("etc/containerd/config.toml") is None
@@ -217,7 +327,7 @@ class TestProvisionersExecution:
 
         # Boundary 1: unknown arch
         sandbox_mips = MockSandbox(tmp_path / "mips", arch="mips64")
-        res_mips = sandbox_mips.run_script(script, env_vars={"STARGZ_VERSION": "0.18.2"})
+        res_mips = sandbox_mips.run_script(script, env_vars=STARGZ_ENV)
         assert res_mips.returncode != 0
         assert "Unsupported architecture" in res_mips.stderr
 
@@ -231,12 +341,13 @@ class TestProvisionersExecution:
         sandbox = MockSandbox(tmp_path)
         script = PROVISIONERS_DIR / "62-hpc-enroot.sh"
 
-        res = sandbox.run_script(script, env_vars={"ENROOT_VERSION": "3.4.1"})
+        res = sandbox.run_script(script, env_vars=ENROOT_ENV)
         assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
 
         apt_cmds = res.find_commands("apt-get")
+        pin = ENROOT_ENV["ENROOT_VERSION"]
         assert any(
-            "install" in cmd and "enroot_3.4.1-1_amd64.deb" in cmd and "enroot+caps_3.4.1-1_amd64.deb" in cmd
+            "install" in cmd and f"enroot_{pin}-1_amd64.deb" in cmd and f"enroot+caps_{pin}-1_amd64.deb" in cmd
             for cmd in apt_cmds
         )
 
@@ -245,7 +356,7 @@ class TestProvisionersExecution:
         sandbox = MockSandbox(tmp_path)
         script = PROVISIONERS_DIR / "62-hpc-enroot.sh"
 
-        res = sandbox.run_script(script, env_vars={"ENROOT_VERSION": "3.4.1", "MOCK_ENROOT_VERSION": "1.0.0"})
+        res = sandbox.run_script(script, env_vars={**ENROOT_ENV, "MOCK_ENROOT_VERSION": "1.0.0"})
         assert res.returncode != 0
         assert "enroot version check failed" in res.stderr
 
@@ -263,7 +374,7 @@ class TestProvisionersExecution:
         sandbox = MockSandbox(tmp_path)
         res = sandbox.run_script(
             PROVISIONERS_DIR / "52-k3s-runtime.sh",
-            env_vars={"K3S_ROLE": role, "MOCK_FAIL": "systemctl"},
+            env_vars={**K3S_ENV, "K3S_ROLE": role, "MOCK_FAIL": "systemctl"},
         )
         assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
         installs = res.find_commands("sh")
@@ -276,7 +387,7 @@ class TestProvisionersExecution:
     def test_52_k3s_refuses_an_enabled_unit(self, tmp_path: Path, require_bash, role: str, unit: str) -> None:
         """Negative: the mocked systemctl reports the unit enabled, so the build stops (run 39140519699)."""
         sandbox = MockSandbox(tmp_path)
-        res = sandbox.run_script(PROVISIONERS_DIR / "52-k3s-runtime.sh", env_vars={"K3S_ROLE": role})
+        res = sandbox.run_script(PROVISIONERS_DIR / "52-k3s-runtime.sh", env_vars={**K3S_ENV, "K3S_ROLE": role})
         assert res.returncode != 0, "an enabled k3s unit passed the provisioner"
         assert f"{unit} is enabled" in res.stderr
 
@@ -355,7 +466,7 @@ class TestProvisionersExecution:
         cfg_dir.mkdir(parents=True, exist_ok=True)
         (cfg_dir / "common.yaml").write_text("schemaVersion: 2.0.0\n", encoding="utf-8")
 
-        res = sandbox.run_script(script, env_vars={"CST_VERSION": "1.22.1", "FLAVOR": "base-generic"})
+        res = sandbox.run_script(script, env_vars={**CST_ENV, "FLAVOR": "base-generic"})
         assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
 
         curl_cmds = res.find_commands("curl")
@@ -385,7 +496,7 @@ class TestProvisionersExecution:
 
         res = sandbox.run_script(
             script,
-            env_vars={"CST_VERSION": "1.22.1", "FLAVOR": "base-generic", "MOCK_MISMATCH_SHA": "1"},
+            env_vars={**CST_ENV, "FLAVOR": "base-generic", "MOCK_MISMATCH_SHA": "1"},
         )
         assert res.returncode != 0
         assert "Checksum verification failed" in res.stderr
@@ -402,7 +513,7 @@ class TestProvisionersExecution:
 
         res = sandbox.run_script(
             script,
-            env_vars={"CST_VERSION": "1.22.1", "FLAVOR": "base-generic", "MOCK_CST_MISSING_LINE": "1"},
+            env_vars={**CST_ENV, "FLAVOR": "base-generic", "MOCK_CST_MISSING_LINE": "1"},
         )
         assert res.returncode != 0
         assert "Asset container-structure-test-linux-amd64 not found in checksums.txt" in res.stderr
@@ -419,7 +530,7 @@ class TestProvisionersExecution:
 
         res = sandbox.run_script(
             script,
-            env_vars={"CST_VERSION": "1.22.1", "FLAVOR": "base-generic", "MOCK_CST_FAIL": "assertion-failed"},
+            env_vars={**CST_ENV, "FLAVOR": "base-generic", "MOCK_CST_FAIL": "assertion-failed"},
         )
         assert res.returncode != 0
         assert "Container structure tests failed for flavor 'base-generic'" in res.stderr
@@ -429,7 +540,7 @@ class TestProvisionersExecution:
         sandbox = MockSandbox(tmp_path, arch="mips64")
         script = PROVISIONERS_DIR / "98-structure-test.sh"
 
-        res = sandbox.run_script(script, env_vars={"CST_VERSION": "1.22.1", "FLAVOR": "base-generic"})
+        res = sandbox.run_script(script, env_vars={**CST_ENV, "FLAVOR": "base-generic"})
         assert res.returncode != 0
         assert "Unsupported architecture" in res.stderr
 
@@ -447,7 +558,7 @@ class TestProvisionersExecution:
         (marker_k8s / "stargz-snapshotter.service").touch()
 
         script = PROVISIONERS_DIR / "98-structure-test.sh"
-        res_k8s = sandbox_k8s.run_script(script, env_vars={"CST_VERSION": "1.22.1", "FLAVOR": "k8s-node-generic"})
+        res_k8s = sandbox_k8s.run_script(script, env_vars={**CST_ENV, "FLAVOR": "k8s-node-generic"})
         assert res_k8s.returncode == 0, f"k8s selection failed: {res_k8s.stderr}"
         cst_cmds_k8s = res_k8s.find_commands("container-structure-test")
         assert len(cst_cmds_k8s) == 1
@@ -464,7 +575,7 @@ class TestProvisionersExecution:
 
         res_enroot = sandbox_enroot.run_script(
             script,
-            env_vars={"CST_VERSION": "1.22.1", "FLAVOR": "ai-infer-nvidia", "MOCK_HAS_ENROOT": "1"},
+            env_vars={**CST_ENV, "FLAVOR": "ai-infer-nvidia", "MOCK_HAS_ENROOT": "1"},
         )
         assert res_enroot.returncode == 0, f"enroot selection failed: {res_enroot.stderr}"
         cst_cmds_enroot = res_enroot.find_commands("container-structure-test")
@@ -481,7 +592,7 @@ class TestProvisionersExecution:
         res_no_cst = sandbox.run_script(script, env_vars={"CST_VERSION": "", "FLAVOR": "base-generic"})
         assert res_no_cst.returncode != 0
 
-        res_no_flv = sandbox.run_script(script, env_vars={"CST_VERSION": "1.22.1", "FLAVOR": ""})
+        res_no_flv = sandbox.run_script(script, env_vars={**CST_ENV, "FLAVOR": ""})
         assert res_no_flv.returncode != 0
 
 
@@ -504,14 +615,16 @@ class TestProvisionersFailClosed:
         self, tmp_path: Path, require_bash, script_name: str, failing_command: str
     ) -> None:
         sandbox = MockSandbox(tmp_path)
-        res = sandbox.run_script(PROVISIONERS_DIR / script_name, env_vars={**ROCM_ENV, "MOCK_FAIL": failing_command})
+        res = sandbox.run_script(
+            PROVISIONERS_DIR / script_name, env_vars={**ROCM_ENV, **DOCKER_ENV, "MOCK_FAIL": failing_command}
+        )
         assert res.returncode != 0, f"{script_name} ignored a failed {failing_command}"
         assert res.has_command(failing_command), f"{failing_command} was never reached"
 
     def test_group_membership_is_requested(self, tmp_path: Path, require_bash) -> None:
         """The mocked usermod records the call, so it never reaches the host's real usermod."""
         sandbox = MockSandbox(tmp_path)
-        res = sandbox.run_script(PROVISIONERS_DIR / "40-docker-runtime.sh")
+        res = sandbox.run_script(PROVISIONERS_DIR / "40-docker-runtime.sh", env_vars=DOCKER_ENV)
         assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
         assert "usermod -aG docker ubuntu" in res.commands_log
 

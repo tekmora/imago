@@ -51,8 +51,32 @@
       "matchManagers": [
         "gomod"
       ],
+      "matchDepNames": [
+        "!go"
+      ],
       "groupName": "go-modules",
       "groupSlug": "go-modules"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepNames": [
+        "go"
+      ],
+      "matchDepTypes": [
+        "golang"
+      ],
+      "rangeStrategy": "bump",
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "matchDepNames": [
+        "go"
+      ],
+      "groupName": "go-toolchain",
+      "groupSlug": "go-toolchain",
+      "minimumReleaseAge": "7 days"
     },
     {
       "matchDatasources": [
@@ -257,6 +281,17 @@
       "depNameTemplate": "hashicorp/packer-plugin-proxmox",
       "datasourceTemplate": "github-releases",
       "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.needs\\.yaml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\\r?\\n)go_version:[ \\t]+(?<currentValue>\\d+\\.\\d+\\.\\d+)[ \\t]*(?:\\r?\\n|$)"
+      ],
+      "depNameTemplate": "go",
+      "datasourceTemplate": "golang-version"
     }
   ]
 }

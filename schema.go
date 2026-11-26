@@ -9,3 +9,8 @@ import _ "embed"
 //
 //go:embed versions.schema.json
 var VersionsSchema []byte
+
+// PinEnvMapping maps shared provisioner environment names to versions.json key paths.
+//
+//go:embed packer/pin-env.json
+var PinEnvMapping []byte

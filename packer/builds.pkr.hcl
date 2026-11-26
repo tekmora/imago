@@ -4,80 +4,14 @@
 locals {
   manifest = jsondecode(file("${path.root}/../versions.json"))
 
-  distro_release           = local.manifest.distro.release
-  k8s_major_minor          = local.manifest.kubernetes.major_minor
-  k8s_version              = local.manifest.kubernetes.version
-  img_pause                = local.manifest.kubernetes.images.pause
-  img_coredns              = local.manifest.kubernetes.images.coredns
-  img_cilium               = local.manifest.kubernetes.images.cilium
-  img_cilium_operator      = local.manifest.kubernetes.images.cilium_operator
-  img_kube_vip             = local.manifest.kubernetes.images.kube_vip
-  img_node_exporter        = local.manifest.kubernetes.images.node_exporter
-  img_calico_cni           = local.manifest.kubernetes.images.calico_cni
-  img_calico_node          = local.manifest.kubernetes.images.calico_node
-  img_calico_ctrl          = local.manifest.kubernetes.images.calico_controllers
-  img_flannel              = local.manifest.kubernetes.images.flannel
-  img_flannel_cni          = local.manifest.kubernetes.images.flannel_cni
-  img_intel_plugin         = local.manifest.drivers.intel.k8s_plugin
-  img_amd_plugin           = local.manifest.drivers.amd.k8s_plugin
-  img_nvidia_plugin        = local.manifest.drivers.nvidia.k8s_plugin
-  nvidia_legacy_driver     = local.manifest.drivers.nvidia.legacy_driver
-  nvidia_mainstream_driver = local.manifest.drivers.nvidia.mainstream_driver
-  nvidia_modern_driver     = local.manifest.drivers.nvidia.modern_driver
-  nvidia_bleeding_driver   = local.manifest.drivers.nvidia.bleeding_driver
-  nvidia_datacenter_driver = local.manifest.drivers.nvidia.datacenter_driver
-  cuda_legacy              = local.manifest.drivers.nvidia.cuda_legacy
-  cuda_mainstream          = local.manifest.drivers.nvidia.cuda_mainstream
-  cuda_modern              = local.manifest.drivers.nvidia.cuda_modern
-  cuda_bleeding            = local.manifest.drivers.nvidia.cuda_bleeding
-  rocm_legacy_version      = local.manifest.drivers.amd.rocm_legacy_version
-  rocm_bleeding_version    = local.manifest.drivers.amd.rocm_bleeding_version
-  rocm_repo                = local.manifest.drivers.amd.rocm_repo
-  rocm_apt_suite           = local.manifest.drivers.amd.rocm_apt_suite
-  k3s_version              = try(local.manifest.k3s.version, "v1.36.4+k3s1")
-  crun_version             = try(local.manifest.runtimes.crun, "1.20")
-  stargz_version           = try(local.manifest.runtimes.stargz_snapshotter, "0.18.2")
-  cdebug_version           = local.manifest.tools.cdebug
-  cst_version              = local.manifest.tools.container_structure_test
-  enroot_version           = try(local.manifest.tools.enroot, "3.4.1")
+  pin_paths = {
+    for name, key_path in jsondecode(file("${path.root}/pin-env.json")) :
+    name => regex("^([^.]+)\\.([^.]+)(?:\\.([^.]+))?$", key_path)
+  }
 
   common_env = [
-    "DISTRO_RELEASE=${local.distro_release}",
-    "K8S_MAJOR_MINOR=${local.k8s_major_minor}",
-    "K8S_VERSION=${local.k8s_version}",
-    "K3S_VERSION=${local.k3s_version}",
-    "CRUN_VERSION=${local.crun_version}",
-    "STARGZ_VERSION=${local.stargz_version}",
-    "CDEBUG_VERSION=${local.cdebug_version}",
-    "CST_VERSION=${local.cst_version}",
-    "ENROOT_VERSION=${local.enroot_version}",
-    "IMG_PAUSE=${local.img_pause}",
-    "IMG_COREDNS=${local.img_coredns}",
-    "IMG_CILIUM=${local.img_cilium}",
-    "IMG_CILIUM_OPERATOR=${local.img_cilium_operator}",
-    "IMG_CALICO_CNI=${local.img_calico_cni}",
-    "IMG_CALICO_NODE=${local.img_calico_node}",
-    "IMG_CALICO_CTRL=${local.img_calico_ctrl}",
-    "IMG_FLANNEL=${local.img_flannel}",
-    "IMG_FLANNEL_CNI=${local.img_flannel_cni}",
-    "IMG_KUBE_VIP=${local.img_kube_vip}",
-    "IMG_NODE_EXPORTER=${local.img_node_exporter}",
-    "IMG_INTEL_PLUGIN=${local.img_intel_plugin}",
-    "IMG_AMD_PLUGIN=${local.img_amd_plugin}",
-    "IMG_NVIDIA_PLUGIN=${local.img_nvidia_plugin}",
-    "NVIDIA_LEGACY_DRIVER=${local.nvidia_legacy_driver}",
-    "NVIDIA_MAINSTREAM_DRIVER=${local.nvidia_mainstream_driver}",
-    "NVIDIA_MODERN_DRIVER=${local.nvidia_modern_driver}",
-    "NVIDIA_BLEEDING_DRIVER=${local.nvidia_bleeding_driver}",
-    "NVIDIA_DATACENTER_BRANCH=${local.nvidia_datacenter_driver}",
-    "CUDA_LEGACY=${local.cuda_legacy}",
-    "CUDA_MAINSTREAM=${local.cuda_mainstream}",
-    "CUDA_MODERN=${local.cuda_modern}",
-    "CUDA_BLEEDING=${local.cuda_bleeding}",
-    "ROCM_VERSION=${local.rocm_bleeding_version}",
-    "ROCM_LEGACY_VERSION=${local.rocm_legacy_version}",
-    "ROCM_REPO=${local.rocm_repo}",
-    "ROCM_APT_SUITE=${local.rocm_apt_suite}"
+    for name, keys in local.pin_paths :
+    keys[2] == null ? "${name}=${local.manifest[keys[0]][keys[1]]}" : "${name}=${local.manifest[keys[0]][keys[1]][keys[2]]}"
   ]
 }
 
@@ -1288,6 +1222,3 @@ build {
     ]
   }
 }
-
-
-
