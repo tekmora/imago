@@ -14,8 +14,21 @@ from tests.harness.live import skip_or_fail
 from tests.harness.mock_runner import GIT_BASH, MockSandbox
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ROCM_ENV = {"ROCM_VERSION": "7.2.4", "ROCM_REPO": "https://repo.example.com/rocm", "ROCM_APT_SUITE": "noble"}
-K8S_ENV = {"CDEBUG_VERSION": "0.0.0", "K8S_VERSION": "1.37.0", "CRUN_VERSION": "1.20"}
+ROCM_ENV = {
+    "DISTRO_RELEASE": "resolute",
+    "ROCM_VERSION": "7.2.4",
+    "ROCM_REPO": "https://repo.example.com/rocm",
+    "ROCM_APT_SUITE": "noble",
+}
+DOCKER_ENV = {"DISTRO_RELEASE": "resolute", "CDEBUG_VERSION": "0.0.0"}
+K8S_ENV = {
+    "CDEBUG_VERSION": "0.0.0",
+    "K8S_MAJOR_MINOR": "1.37",
+    "K8S_VERSION": "1.37.0",
+    "CRUN_VERSION": "1.20",
+    "IMG_PAUSE": "registry.k8s.io/pause:3.10",
+}
+K3S_ENV = {"K3S_VERSION": "v1.36.4+k3s1"}
 PODMAN_ENV = {"CDEBUG_VERSION": "0.0.0", "CRUN_VERSION": "1.20"}
 NVIDIA_ENV = {
     "33-gpu-nvidia-legacy.sh": {"NVIDIA_LEGACY_DRIVER": "0", "CUDA_LEGACY": "0.0.0"},
@@ -168,7 +181,7 @@ class TestProvisionersExecution:
         sandbox = MockSandbox(tmp_path, arch="amd64")
         script = PROVISIONERS_DIR / "40-docker-runtime.sh"
 
-        res = sandbox.run_script(script)
+        res = sandbox.run_script(script, env_vars=DOCKER_ENV)
         assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
 
         daemon_json = res.read_file("etc/docker/daemon.json")
@@ -183,6 +196,23 @@ class TestProvisionersExecution:
         assert res.returncode != 0
         assert unset in res.stderr
         assert not res.find_commands("apt-get")
+
+    @pytest.mark.parametrize(
+        ("script", "env", "unset"),
+        [
+            pytest.param("40-docker-runtime.sh", DOCKER_ENV, "DISTRO_RELEASE", id="docker-release"),
+            pytest.param("40-docker-runtime.sh", DOCKER_ENV, "CDEBUG_VERSION", id="docker-cdebug"),
+            pytest.param("41-podman-runtime.sh", PODMAN_ENV, "CDEBUG_VERSION", id="podman-cdebug"),
+            pytest.param("52-k3s-runtime.sh", K3S_ENV, "K3S_VERSION", id="k3s-version"),
+        ],
+    )
+    @pytest.mark.usefixtures("require_bash")
+    def test_container_runtimes_refuse_missing_pins(
+        self, tmp_path: Path, script: str, env: dict[str, str], unset: str
+    ) -> None:
+        res = MockSandbox(tmp_path).run_script(PROVISIONERS_DIR / script, env_vars={**env, unset: ""})
+        assert res.returncode != 0
+        assert f"{unset} must come from versions.json" in res.stderr
 
     def test_50_k8s_runtime_pins_the_kubernetes_patch_release(self, tmp_path: Path, require_bash) -> None:
         """kubelet, kubeadm and kubectl install at the K8S_VERSION patch release, not the channel head."""
@@ -319,7 +349,7 @@ class TestProvisionersExecution:
         sandbox = MockSandbox(tmp_path)
         res = sandbox.run_script(
             PROVISIONERS_DIR / "52-k3s-runtime.sh",
-            env_vars={"K3S_ROLE": role, "MOCK_FAIL": "systemctl"},
+            env_vars={**K3S_ENV, "K3S_ROLE": role, "MOCK_FAIL": "systemctl"},
         )
         assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
         installs = res.find_commands("sh")
@@ -332,7 +362,7 @@ class TestProvisionersExecution:
     def test_52_k3s_refuses_an_enabled_unit(self, tmp_path: Path, require_bash, role: str, unit: str) -> None:
         """Negative: the mocked systemctl reports the unit enabled, so the build stops (run 39140519699)."""
         sandbox = MockSandbox(tmp_path)
-        res = sandbox.run_script(PROVISIONERS_DIR / "52-k3s-runtime.sh", env_vars={"K3S_ROLE": role})
+        res = sandbox.run_script(PROVISIONERS_DIR / "52-k3s-runtime.sh", env_vars={**K3S_ENV, "K3S_ROLE": role})
         assert res.returncode != 0, "an enabled k3s unit passed the provisioner"
         assert f"{unit} is enabled" in res.stderr
 
@@ -560,14 +590,16 @@ class TestProvisionersFailClosed:
         self, tmp_path: Path, require_bash, script_name: str, failing_command: str
     ) -> None:
         sandbox = MockSandbox(tmp_path)
-        res = sandbox.run_script(PROVISIONERS_DIR / script_name, env_vars={**ROCM_ENV, "MOCK_FAIL": failing_command})
+        res = sandbox.run_script(
+            PROVISIONERS_DIR / script_name, env_vars={**ROCM_ENV, **DOCKER_ENV, "MOCK_FAIL": failing_command}
+        )
         assert res.returncode != 0, f"{script_name} ignored a failed {failing_command}"
         assert res.has_command(failing_command), f"{failing_command} was never reached"
 
     def test_group_membership_is_requested(self, tmp_path: Path, require_bash) -> None:
         """The mocked usermod records the call, so it never reaches the host's real usermod."""
         sandbox = MockSandbox(tmp_path)
-        res = sandbox.run_script(PROVISIONERS_DIR / "40-docker-runtime.sh")
+        res = sandbox.run_script(PROVISIONERS_DIR / "40-docker-runtime.sh", env_vars=DOCKER_ENV)
         assert res.returncode == 0, f"Script failed with stderr: {res.stderr}"
         assert "usermod -aG docker ubuntu" in res.commands_log
 

@@ -5,6 +5,7 @@
   seal runs before the power-off and a failed seal stops it.
 - #44: a preheated image that cannot be pulled fails the build; precache requires every
   image to be injected by the build with no fallback pins.
+- Provisioners require their injected pins without shell defaults or default assignments.
 - #40: the QEMU accelerator is a validated variable, and the release build emulates.
 - #43: the compress step reads the directory Packer writes the flavor's image to.
 - #39: the release build installs an ISO authoring tool before Packer writes the seed.
@@ -19,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Collection
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,7 @@ import yaml
 from tests.harness.live import skip_or_fail
 from tests.harness.mock_runner import GIT_BASH, MockSandbox
 from tests.test_provisioners_execution import check_bash
+from tests.test_version_pins_consumed import get_common_env_names
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKER = ROOT / "packer"
@@ -217,9 +220,37 @@ def test_precache_fails_when_an_image_cannot_be_pulled(
     assert "Complete" not in result.stdout
 
 
-def test_precache_holds_no_fallback_defaults() -> None:
-    fallbacks = re.findall(r"\$\{(IMG_\w+):-", PRECACHE.read_text(encoding="utf-8"))
-    assert fallbacks == [], f"precache script still holds hardcoded fallbacks: {fallbacks}"
+def _pin_fallbacks(provisioners: Path, pins: Collection[str]) -> list[str]:
+    pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?[-=]")
+    return [
+        f"{script.relative_to(provisioners)}:{number}: {line.strip()}"
+        for script in sorted(provisioners.rglob("*.sh"))
+        for number, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1)
+        if any(match[1] in pins for match in pattern.finditer(line))
+    ]
+
+
+def test_provisioners_hold_no_pin_fallbacks(tmp_path: Path) -> None:
+    precache = tmp_path / PRECACHE.name
+    precache.write_text('echo "${IMG_PIN:-value}"\n', encoding="utf-8")
+    script = tmp_path / "52-k3s-runtime.sh"
+    cases = [
+        'echo "${PIN:-value}"',
+        'echo "${PIN-value}"',
+        'echo "${PIN:=value}"',
+        'echo "${PIN=value}"',
+        'echo "${PIN:?msg}"',
+        'echo "${PIN}"',
+        'echo "${K3S_ROLE:-agent}"',
+    ]
+    script.write_text("\n".join(cases), encoding="utf-8")
+    assert _pin_fallbacks(tmp_path, {"PIN", "IMG_PIN"}) == [
+        *(f"{script.name}:{i}: {line}" for i, line in enumerate(cases[:4], 1)),
+        f'{precache.name}:1: echo "${{IMG_PIN:-value}}"',
+    ]
+
+    fallbacks = _pin_fallbacks(PROVISIONERS, set(get_common_env_names()))
+    assert not fallbacks, "Provisioner pin fallbacks:\n" + "\n".join(fallbacks)
 
 
 def test_every_image_read_by_precache_is_passed_by_build() -> None:

@@ -39,10 +39,13 @@ Execute this checklist before merging release pull request or cutting new tag.
 
 5. **`release-please` Status**:
    New release pull requests and #58 merge wait on release app migration, issue #256.
-   Check published assets and signed checksums per monthly release procedure in
-   `docs/operations/maintenance-cadence.md`.
    List open pull requests labeled `autorelease: pending`.
 
    ```bash
    gh pr list --label "autorelease: pending"
    ```
+
+## Post-Release Verification
+
+After publication, follow [monthly release procedure](../../../docs/operations/maintenance-cadence.md#31-tasks-procedures).
+Check asset list per release flavor, split-asset parts included; run `cosign verify-blob` on `SHA256SUMS`.

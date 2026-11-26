@@ -142,9 +142,12 @@ def _parse_script(source: bytes, filename: str) -> Node:
     shfmt = shutil.which("shfmt")
     if shfmt is None:
         pytest.fail(f"shfmt is missing from PATH for {filename}; install shfmt-py from .github/requirements/test.txt")
-    result = subprocess.run(
-        [shfmt, "--to-json", "-ln", "bash"], input=source, capture_output=True, check=False, timeout=30
-    )
+    try:
+        result = subprocess.run(
+            [shfmt, "--to-json", "-ln", "bash"], input=source, capture_output=True, check=False, timeout=30
+        )
+    except subprocess.TimeoutExpired as error:
+        pytest.fail(f"shfmt timed out after {error.timeout} seconds parsing {filename}", pytrace=False)
     if result.returncode != 0:
         pytest.fail(f"shfmt could not parse {filename}: {result.stderr.decode(errors='replace').strip()}")
     return json.loads(result.stdout)
@@ -1115,6 +1118,14 @@ class TestVersionPinsConsumed:
         ) as outcome:
             _pins_read('echo "$PIN"', "missing-shfmt.sh", {"PIN"})
         assert isinstance(outcome.value, pytest.fail.Exception), "Missing shfmt must fail the check"
+
+    def test_pin_reader_reports_shfmt_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def time_out(command: list[str], *, timeout: int, **_kwargs: Any) -> None:
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        monkeypatch.setattr(subprocess, "run", time_out)
+        with pytest.raises(pytest.fail.Exception, match=r"timed out after 30 seconds.*slow-provisioner\.sh"):
+            _parse_script(b'echo "$PIN"', "slow-provisioner.sh")
 
     def test_exceptions_validity(self) -> None:
         """Verify exceptions: unexpired, present in common_env, and not consumed (no stale entry)."""

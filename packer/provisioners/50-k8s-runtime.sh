@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Copyright 2026 Lusoris
 # 50-k8s-runtime.sh — Install containerd CRI runtime and Kubernetes node components
-# Consumes K8S_MAJOR_MINOR, K8S_VERSION and CRUN_VERSION injected from versions.json (Ubuntu 26.04).
+# Consumes K8S_MAJOR_MINOR, K8S_VERSION, CRUN_VERSION, IMG_PAUSE and CDEBUG_VERSION from versions.json.
 # Complies with NASA/JPL Power of 10: short functions (<= 60 lines), checked returns.
 set -euo pipefail
 
-kubernetes_channel="${K8S_MAJOR_MINOR:-1.37}"
+kubernetes_channel="${K8S_MAJOR_MINOR:?K8S_MAJOR_MINOR must come from versions.json}"
 : "${K8S_VERSION:?K8S_VERSION must come from versions.json}"
 : "${CRUN_VERSION:?CRUN_VERSION must come from versions.json}"
-pause_image="${IMG_PAUSE:-registry.k8s.io/pause:3.10}"
+pause_image="${IMG_PAUSE:?IMG_PAUSE must come from versions.json}"
 : "${CDEBUG_VERSION:?CDEBUG_VERSION must come from versions.json}"
 
 setup_containerd() {

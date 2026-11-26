@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Copyright 2026 Lusoris
 # 52-k3s-runtime.sh — Install K3s lightweight Kubernetes engine for edge & homelabs
-# Consumes K3S_VERSION and K3S_ROLE injected dynamically from versions.json.
+# Consumes K3S_VERSION from versions.json and K3S_ROLE from the build flavor.
 # Complies with NASA/JPL Power of 10: short functions (<= 60 lines), checked returns.
 set -euo pipefail
 
-k3s_version="${K3S_VERSION:-v1.36.4+k3s1}"
+k3s_version="${K3S_VERSION:?K3S_VERSION must come from versions.json}"
 K3S_ROLE="${K3S_ROLE:-agent}"
 
 setup_k3s_prerequisites() {

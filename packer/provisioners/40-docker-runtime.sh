@@ -2,10 +2,11 @@
 # Copyright 2026 Lusoris
 # 40-docker-runtime.sh — Install Docker CE, Docker Compose v2, and containerd.io
 # Configures log rotation, systemd cgroup driver, userland-proxy=false, and CDI support.
+# Consumes DISTRO_RELEASE and CDEBUG_VERSION from versions.json.
 # Complies with NASA/JPL Power of 10: short functions (<= 60 lines), checked returns.
 set -euo pipefail
 
-ubuntu_release="${DISTRO_RELEASE:-resolute}"
+ubuntu_release="${DISTRO_RELEASE:?DISTRO_RELEASE must come from versions.json}"
 
 setup_docker_repository() {
   echo "==> Configuring official Docker apt repository on Ubuntu ${ubuntu_release}..."
@@ -56,7 +57,7 @@ EOF
 }
 
 install_cdebug() {
-  local version="${CDEBUG_VERSION:-0.0.19}"
+  local version="${CDEBUG_VERSION:?CDEBUG_VERSION must come from versions.json}"
   local arch
   arch=$(uname -m)
   case "${arch}" in

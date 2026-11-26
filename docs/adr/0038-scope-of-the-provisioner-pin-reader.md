@@ -16,7 +16,7 @@ Use the pin reader (`tests/test_version_pins_consumed.py`) as a tripwire for its
 
 Refuse arithmetic, indirection, dynamic variable names and dynamic code in the listed constructs. Require literal command names, including after the listed prefixes, and literal words in the option and operator positions that select names or code. Refuse the `eval` builtin and extended glob patterns regardless of the names they contain.
 
-Refuse unquoted parameter, command, arithmetic and process expansions in simple command words, loop word lists, array literal elements and non-assignment declaration words. Bash can split unquoted expansions into run-time words in these positions.
+Refuse unquoted parameter, command and arithmetic expansions in simple command words, loop word lists, array literal elements and non-assignment declaration words. Bash can split unquoted expansions into run-time words in these positions. Unquoted process substitution yields a file name and is also unsupported in these positions. The `process-substitution` case in `tests/test_version_pins_consumed.py` verifies the refusal.
 
 Accept only the prefix shapes the provisioners use (`sudo` with optional literal `NAME=value` words and a literal command, `exec` with a literal command, and `command -v` with literal operands when `command` is the first word). Refuse a prefix command after `sudo` or `exec` by name, along with every other prefix shape.
 
