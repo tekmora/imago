@@ -18,7 +18,7 @@ Refuse arithmetic, indirection, dynamic variable names and dynamic code in the l
 
 Refuse unquoted parameter, command, arithmetic and process expansions in simple command words, loop word lists, array literal elements and non-assignment declaration words. Bash can split unquoted expansions into run-time words in these positions.
 
-Accept only the prefix shapes the provisioners use (`sudo` with optional literal `NAME=value` words and a literal command, `exec` with a literal command, and `command -v` with literal operands) and refuse every other prefix shape by name.
+Accept only the prefix shapes the provisioners use (`sudo` with optional literal `NAME=value` words and a literal command, `exec` with a literal command, and `command -v` with literal operands when `command` is the first word). Refuse a prefix command after `sudo` or `exec` by name, along with every other prefix shape.
 
 Alias and function shadowing of command names are outside the tripwire's scope.
 

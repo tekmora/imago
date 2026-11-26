@@ -8,7 +8,8 @@ Also verifies build wiring for stargz-snapshotter (51) and enroot (62).
 
 The reader is a tripwire for the listed read shapes and constructs, not a proof; pin mentions outside the allow-list are refused by name.
 The only prefix shapes are sudo with optional literal NAME=value words and a literal command, exec with a literal command,
-and command -v with literal operands. Every other prefix shape is refused by name.
+and command -v with literal operands when command is the first word. A prefix command after sudo or exec is refused
+by name, as is every other prefix shape.
 A read is an allow-listed expansion Bash performs whenever its statement
 executes. Statement selection (branches, command-level &&, function calls)
 is out of scope. Expression-level conditions (including || and && inside
@@ -404,9 +405,10 @@ def _literal_prefix_operand(word: Node) -> str | None:
     return None
 
 
-def _prefix_command_index(prefix: str, words: list[Node]) -> int | None:
+def _prefix_target(prefix: str, words: list[Node]) -> tuple[int, str] | None:
     if prefix == "exec":
-        return 0 if words and _literal_prefix_operand(words[0]) is not None else None
+        operand = _literal_prefix_operand(words[0]) if words else None
+        return (0, operand) if operand is not None else None
     if prefix == "sudo":
         for index, word in enumerate(words):
             operand = _literal_prefix_operand(word)
@@ -414,33 +416,36 @@ def _prefix_command_index(prefix: str, words: list[Node]) -> int | None:
                 return None
             name, equals, _ = operand.partition("=")
             if not equals or operand.startswith("/"):
-                return index
+                return index, operand
             if not _plain_name(name):
                 return None
     return None
 
 
 def _invoked_command(words: list[Node]) -> tuple[str, list[Node], Violation | None]:
-    while words:
-        name = _command_word(words[0])
-        if isinstance(name, DynamicWord):
-            return "", [], ("dynamic command", "command name")
-        command = name.rsplit("/", 1)[-1]
-        words = words[1:]
+    if not words:
+        return "", [], None
+    name = _command_word(words[0])
+    if isinstance(name, DynamicWord):
+        return "", [], ("dynamic command", "command name")
+    command = name.rsplit("/", 1)[-1]
+    args = words[1:]
+    if command not in _PREFIX_COMMANDS:
+        return command, args, None
+    if (
+        name == "command"
+        and len(args) >= 2
+        and _command_word(args[0]) == "-v"
+        and all(_literal_prefix_operand(word) is not None for word in args[1:])
+    ):
+        return "", [], None
+    target = _prefix_target(name, args)
+    if target is not None:
+        index, operand = target
+        command = operand.rsplit("/", 1)[-1]
         if command not in _PREFIX_COMMANDS:
-            return command, words, None
-        if (
-            name == "command"
-            and len(words) >= 2
-            and _command_word(words[0]) == "-v"
-            and all(_literal_prefix_operand(word) is not None for word in words[1:])
-        ):
-            return "", [], None
-        index = _prefix_command_index(name, words)
-        if index is None:
-            return "", [], ("prefix shape", command)
-        words = words[index:]
-    return "", [], None
+            return command, args[index + 1 :], None
+    return "", [], ("prefix shape", command)
 
 
 def _assignment_name(operand: Argument) -> str | None:
@@ -1036,6 +1041,14 @@ class TestVersionPinsConsumed:
             pytest.param("sudo X={a,'b'} /usr/bin/true", "sudo", id="sudo-quoted-brace"),
             pytest.param("""sudo env -S '/usr/bin/printenv P"I"N'""", "env", id="sudo-env"),
             pytest.param("""exec env -S '/usr/bin/printenv P"I"N'""", "env", id="exec-env"),
+            pytest.param("sudo command -v true", "command", id="sudo-command-v"),
+            pytest.param("exec command -v true", "command", id="exec-command-v"),
+            pytest.param(
+                "sudo DEBIAN_FRONTEND=noninteractive command -v true", "command", id="sudo-assignment-command-v"
+            ),
+            pytest.param("sudo exec /usr/bin/true", "exec", id="sudo-exec"),
+            pytest.param("exec sudo command -v true", "sudo", id="exec-sudo-command-v"),
+            pytest.param("sudo builtin true", "builtin", id="sudo-builtin"),
             pytest.param("command cmd", "command", id="command-without-v"),
             pytest.param("command -v", "command", id="command-missing-operand"),
             pytest.param('x=true; command -v "$x"', "command", id="command-expanded-operand"),
