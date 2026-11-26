@@ -7,6 +7,8 @@ explicit, unexpired exception entry in EXCEPTIONS.
 Also verifies build wiring for stargz-snapshotter (51) and enroot (62).
 
 The reader is a tripwire for the listed read shapes and constructs, not a proof; pin mentions outside the allow-list are refused by name.
+The only prefix shapes are sudo with optional literal NAME=value words and a literal command, exec with a literal command,
+and command -v with literal operands. Every other prefix shape is refused by name.
 A read is an allow-listed expansion Bash performs whenever its statement
 executes. Statement selection (branches, command-level &&, function calls)
 is out of scope. Expression-level conditions (including || and && inside
@@ -79,9 +81,8 @@ _CONSTRUCT_REFUSALS = {
     "dynamic code": "the code word must be fully literal",
     "dynamic command": "the command name must be fully literal",
     "dynamic option": "an option or test operator word must be fully literal",
-    "unresolved option": "the command reads an abbreviated or unknown long option the reader cannot resolve",
+    "prefix shape": "the reader accepts only the prefix shapes the provisioners use",
     "unquoted expansion": "Bash splits the result into words at run time",
-    "split string": "env re-splits and expands the value itself",
     "eval": "eval reparses its arguments as shell code",
     "extglob": "extended glob patterns are outside the reader's word rules",
 }
@@ -97,73 +98,8 @@ _NAME_COMMANDS = {"[", "test", "printf", "getopts", "read", "mapfile", "readarra
 _CODE_COMMANDS = {"eval", "trap", ".", "source", "bash", "sh", "mapfile", "readarray"}
 
 
-class PrefixOptions(NamedTuple):
-    short_values: str = ""
-    long_required: tuple[str, ...] = ()
-    long_optional: tuple[str, ...] = ()
-    long_switches: tuple[str, ...] = ()
-
-
-_PREFIX_OPTIONS = {
-    # Sudo 1.9.17p2 sudo(8) and the installed sudo_long_opts table.
-    "sudo": PrefixOptions(
-        "aCcDghpRrtTu",
-        (
-            "auth-type",
-            "chdir",
-            "chroot",
-            "close-from",
-            "command-timeout",
-            "group",
-            "host",
-            "login-class",
-            "other-user",
-            "prompt",
-            "role",
-            "type",
-            "user",
-        ),
-        ("preserve-env",),
-        (
-            "askpass",
-            "background",
-            "bell",
-            "edit",
-            "help",
-            "list",
-            "login",
-            "no-update",
-            "non-interactive",
-            "preserve-groups",
-            "remove-timestamp",
-            "reset-timestamp",
-            "set-home",
-            "shell",
-            "stdin",
-            "validate",
-            "version",
-        ),
-    ),
-    # GNU coreutils 9.12 --help.
-    "env": PrefixOptions(
-        "aCSu",
-        ("argv0", "chdir", "env0-from", "split-string", "unset"),
-        ("block-signal", "default-signal", "ignore-signal"),
-        ("debug", "help", "ignore-environment", "list-signal-handling", "null", "version"),
-    ),
-    "nohup": PrefixOptions(long_switches=("help", "version")),
-    "timeout": PrefixOptions(
-        "ks",
-        ("kill-after", "signal"),
-        long_switches=("foreground", "help", "preserve-status", "verbose", "version"),
-    ),
-    # Bash 5.3.20 builtin help and option handling.
-    "exec": PrefixOptions("a"),
-    "command": PrefixOptions(),
-    "builtin": PrefixOptions(),
-}
+_PREFIX_COMMANDS = {"sudo", "exec", "command", "env", "timeout", "nohup", "builtin"}
 _OPTION_VALUES = {
-    **{command: set(options.short_values) | set(options.long_required) for command, options in _PREFIX_OPTIONS.items()},
     ".": {"p"},
     "source": {"p"},
     "bash": {"O", "o", "+O", "+o", "init-file", "rcfile"},
@@ -413,20 +349,11 @@ def _option_fields(word: str) -> Iterator[tuple[str, str | None]]:
             yield key, word[position + 1 :] or None
 
 
-def _resolve_long_option(flag: str, options: PrefixOptions) -> str | None:
-    names = (*options.long_required, *options.long_optional, *options.long_switches)
-    if flag in names:
-        return flag
-    matches = [name for name in names if name.startswith(flag)]
-    return matches[0] if len(matches) == 1 else None
-
-
 def _take_options(
     command: str, args: list[Argument]
 ) -> tuple[dict[str, Argument | None], list[Argument], list[Violation]]:
     options: dict[str, Argument | None] = {}
     violations: list[Violation] = []
-    prefix = _PREFIX_OPTIONS.get(command)
     takes_value = _OPTION_VALUES.get(command, set())
     signs = ("-", "+") if command in _REFERENCE_DECLARATIONS | _SHELL_COMMANDS else ("-",)
     index = 0
@@ -439,10 +366,6 @@ def _take_options(
         if not dynamic and (word == "--" or (word == "-" and command in _SHELL_COMMANDS)):
             index += 1
             break
-        # sudo reads VAR=value among its options and treats leading / or = as a command operand.
-        if command == "sudo" and not word.startswith(("-", "/", "=")) and "=" in word:
-            index += 1
-            continue
         if (
             not word
             or word in {"-", "+"}
@@ -451,21 +374,12 @@ def _take_options(
         ):
             break
         index += 1
-        for spelling, attached in _option_fields(word):
-            flag = spelling
-            if prefix is not None and word.startswith("--"):
-                resolved = _resolve_long_option(flag, prefix)
-                if resolved is None:
-                    violations.append(("unresolved option", f"{command} --{flag}"))
-                    return options, [], violations
-                flag = resolved
-            required = flag in takes_value
-            optional = prefix is not None and flag in prefix.long_optional
-            if not required and not optional:
+        for flag, attached in _option_fields(word):
+            if flag not in takes_value:
                 options[flag] = None
                 continue
             value: Argument | None = DynamicWord(attached or "") if dynamic else attached
-            if required and value is None and index < len(args):
+            if value is None and index < len(args):
                 value = args[index]
                 index += 1
             options[flag] = value
@@ -473,39 +387,60 @@ def _take_options(
     return options, args[index:], violations
 
 
-def _invoked_command(words: list[Node]) -> tuple[str, list[Node], list[Violation]]:
-    violations: list[Violation] = []
-    prefix = ""
+def _plain_name(value: Argument | None) -> bool:
+    return isinstance(value, str) and _PIN_NAME.fullmatch(value) is not None
+
+
+def _literal_prefix_operand(word: Node) -> str | None:
+    # Unquoted braces and brackets can form expansions across quote boundaries.
+    if any(
+        part["Type"] == "Lit" and re.search(r"[\[{}]", _UNQUOTED_ESCAPE.sub("", part["Value"]))
+        for part in word["Parts"]
+    ):
+        return None
+    value = _command_word(word)
+    if isinstance(value, str) and value and not value.startswith("-"):
+        return value
+    return None
+
+
+def _prefix_command_index(prefix: str, words: list[Node]) -> int | None:
+    if prefix == "exec":
+        return 0 if words and _literal_prefix_operand(words[0]) is not None else None
+    if prefix == "sudo":
+        for index, word in enumerate(words):
+            operand = _literal_prefix_operand(word)
+            if operand is None:
+                return None
+            name, equals, _ = operand.partition("=")
+            if not equals or operand.startswith("/"):
+                return index
+            if not _plain_name(name):
+                return None
+    return None
+
+
+def _invoked_command(words: list[Node]) -> tuple[str, list[Node], Violation | None]:
     while words:
         name = _command_word(words[0])
         if isinstance(name, DynamicWord):
-            violations.append(("dynamic command", f"{prefix} command name" if prefix else "command name"))
-            break
+            return "", [], ("dynamic command", "command name")
         command = name.rsplit("/", 1)[-1]
         words = words[1:]
-        if command not in _PREFIX_OPTIONS:
-            return command, words, violations
-        values = [_command_word(word) for word in words]
-        options, remaining, option_violations = _take_options(command, values)
-        violations.extend(option_violations)
-        if command == "env" and options.keys() & {"S", "split-string"}:
-            violations.append(("split string", "env split-string option"))
-        if command == "command" and options.keys() & {"v", "V"}:
-            break
-        skipped = len(words) - len(remaining)
-        if command == "env":
-            for index, value in enumerate(remaining):
-                literal = value.prefix if isinstance(value, DynamicWord) else value
-                if "=" not in literal and not (index == 0 and value == "-"):
-                    break
-                skipped += 1
-        words = words[skipped + (command == "timeout") :]
-        prefix = command
-    return "", [], violations
-
-
-def _plain_name(value: Argument | None) -> bool:
-    return isinstance(value, str) and _PIN_NAME.fullmatch(value) is not None
+        if command not in _PREFIX_COMMANDS:
+            return command, words, None
+        if (
+            name == "command"
+            and len(words) >= 2
+            and _command_word(words[0]) == "-v"
+            and all(_literal_prefix_operand(word) is not None for word in words[1:])
+        ):
+            return "", [], None
+        index = _prefix_command_index(name, words)
+        if index is None:
+            return "", [], ("prefix shape", command)
+        words = words[index:]
+    return "", [], None
 
 
 def _assignment_name(operand: Argument) -> str | None:
@@ -605,8 +540,9 @@ def _command_violations(command: str, args: list[Argument]) -> Iterator[Violatio
 
 
 def _call_violations(node: Node) -> Iterator[Violation]:
-    command, words, violations = _invoked_command(node.get("Args", []))
-    yield from violations
+    command, words, violation = _invoked_command(node.get("Args", []))
+    if violation is not None:
+        yield violation
     if command == "let":
         yield "arithmetic", "let"
     if command in _DECLARATIONS | _NAME_COMMANDS | _CODE_COMMANDS:
@@ -892,13 +828,13 @@ class TestVersionPinsConsumed:
             pytest.param('getopts a "$NAME" -a', "dynamic name", id="getopts-name"),
             pytest.param('unset -v "$NAME"', "dynamic name", id="unset-name"),
             pytest.param('mapfile -C"$CODE" -c1', "dynamic code", id="mapfile-callback"),
-            pytest.param('command -- eval "$CODE"', "dynamic code", id="command-eval"),
-            pytest.param('builtin source -- "$FILE"', "dynamic code", id="builtin-source"),
+            pytest.param('command -- eval "$CODE"', "prefix shape", id="command-eval"),
+            pytest.param('builtin source -- "$FILE"', "prefix shape", id="builtin-source"),
             pytest.param(
-                'env MARK="$VALUE" nohup timeout -k 1 1 /usr/bin/bash -uc "$CODE"', "dynamic code", id="nested-wrappers"
+                'env MARK="$VALUE" nohup timeout -k 1 1 /usr/bin/bash -uc "$CODE"', "prefix shape", id="nested-wrappers"
             ),
-            pytest.param('exec -a runner /usr/bin/bash -uc "$CODE"', "dynamic code", id="exec-shell"),
-            pytest.param('timeout 1 sh -uc "$CODE"', "dynamic code", id="timeout-shell"),
+            pytest.param('exec -a runner /usr/bin/bash -uc "$CODE"', "prefix shape", id="exec-shell"),
+            pytest.param('timeout 1 sh -uc "$CODE"', "prefix shape", id="timeout-shell"),
             pytest.param("""trap 'echo $PIN' EXIT""", "literal word", id="literal-trap-pin"),
             pytest.param('[ "$#" -ne 2 ]', "", id="bracket-numeric-test"),
             pytest.param('export HF_HOME="/var/lib/models/huggingface"', "", id="export-assignment"),
@@ -958,7 +894,7 @@ class TestVersionPinsConsumed:
         ("content", "group"),
         [
             pytest.param('cmd=eval; "$cmd" \'echo "$PI\\\nN"\'', "dynamic command", id="expanded-command"),
-            pytest.param('cmd=eval; builtin "$cmd" \'echo "$PI\\\nN"\'', "dynamic command", id="builtin-command"),
+            pytest.param('cmd=eval; builtin "$cmd" \'echo "$PI\\\nN"\'', "prefix shape", id="builtin-command"),
             pytest.param('"$(printf %s eval)" \'echo "$PI\\\nN"\'', "dynamic command", id="substituted-command"),
             pytest.param('opts=-uc; /usr/bin/bash "$opts" \'echo "$PI\\\nN"\'', "dynamic option", id="shell-options"),
             pytest.param(
@@ -970,7 +906,7 @@ class TestVersionPinsConsumed:
             pytest.param('op==; test ! x "$op" y', "dynamic option", id="negated-binary-operator"),
             pytest.param('op=-n; test "(" "$op" x ")"', "dynamic option", id="parenthesized-unary-operator"),
             pytest.param('test x -a y -o "$x"', "dynamic option", id="long-test"),
-            pytest.param('flag=-p; command "$flag" -- true', "dynamic option", id="prefix-option"),
+            pytest.param('flag=-p; command "$flag" -- true', "prefix shape", id="prefix-option"),
             pytest.param('flag=-p; declare "$flag" x', "dynamic option", id="declaration-option"),
             pytest.param('sh "$script"', "dynamic option", id="shell-first-argument"),
             pytest.param('eval "echo ready"', "eval", id="literal-eval"),
@@ -1002,12 +938,12 @@ class TestVersionPinsConsumed:
     @pytest.mark.parametrize(
         ("content", "group"),
         [
-            pytest.param("x='/usr/bin/printf env-short'; env -S \"$x\"", "split string", id="env-short"),
-            pytest.param("x='/usr/bin/printf env-long'; env --split-string=\"$x\"", "split string", id="env-long"),
-            pytest.param("env -S 'printf %s ${PIN}'", "split string", id="env-literal"),
-            pytest.param("x='/usr/bin/printf env-cluster'; env -vS \"$x\"", "split string", id="env-cluster"),
+            pytest.param("x='/usr/bin/printf env-short'; env -S \"$x\"", "prefix shape", id="env-short"),
+            pytest.param("x='/usr/bin/printf env-long'; env --split-string=\"$x\"", "prefix shape", id="env-long"),
+            pytest.param("env -S 'printf %s ${PIN}'", "prefix shape", id="env-literal"),
+            pytest.param("x='/usr/bin/printf env-cluster'; env -vS \"$x\"", "prefix shape", id="env-cluster"),
             pytest.param(
-                "x='/usr/bin/printf env-separate'; env --split-string \"$x\"", "split string", id="env-long-separate"
+                "x='/usr/bin/printf env-separate'; env --split-string \"$x\"", "prefix shape", id="env-long-separate"
             ),
             pytest.param(
                 "n='runner /usr/bin/printf exec=%s'; exec -a $n /usr/bin/true", "unquoted expansion", id="exec-argv0"
@@ -1028,16 +964,22 @@ class TestVersionPinsConsumed:
             ),
             pytest.param("x='one  two'; a=($x); declare -p a", "unquoted expansion", id="array"),
             pytest.param("x='one  two'; declare -a a=($x); declare -p a", "unquoted expansion", id="declaration-array"),
-            pytest.param('x=/usr/bin/true; command -- "$x"', "dynamic command", id="command-after-dashes"),
-            pytest.param('x=/usr/bin/true; command "$x"', "dynamic command", id="command-without-dashes"),
+            pytest.param('x=/usr/bin/true; command -- "$x"', "prefix shape", id="command-after-dashes"),
+            pytest.param('x=/usr/bin/true; command "$x"', "prefix shape", id="command-without-dashes"),
             pytest.param("z='a b'; declare $z; declare -p a b", "unquoted expansion", id="declaration-word"),
             pytest.param("x='/usr/bin/printf command-name'; $x", "unquoted expansion", id="command-name"),
             pytest.param('x="one  two"; printf "<%s>" "prefix "$x', "unquoted expansion", id="partly-quoted"),
             pytest.param("echo $(printf 'one  two')", "unquoted expansion", id="command-substitution"),
             pytest.param("echo $((1 + 1))", "unquoted expansion", id="arithmetic-expansion"),
             pytest.param("cat <(printf process)", "unquoted expansion", id="process-substitution"),
-            pytest.param("n='runner /usr/bin/printf exec=%s'; exec -a \"$n\" /usr/bin/true", "", id="quoted-argv0"),
-            pytest.param("d='1 /usr/bin/printf timeout=%s'; timeout -- \"$d\" /usr/bin/true", "", id="quoted-duration"),
+            pytest.param(
+                "n='runner /usr/bin/printf exec=%s'; exec -a \"$n\" /usr/bin/true", "prefix shape", id="quoted-argv0"
+            ),
+            pytest.param(
+                "d='1 /usr/bin/printf timeout=%s'; timeout -- \"$d\" /usr/bin/true",
+                "prefix shape",
+                id="quoted-duration",
+            ),
             pytest.param('set -- one; [ "$#" -ne 2 ]', "", id="argument-count"),
             pytest.param('x="one two"; [ -n "$x" ]', "", id="quoted-test"),
             pytest.param("x=y; [[ $x == y ]]", "", id="double-bracket"),
@@ -1047,8 +989,8 @@ class TestVersionPinsConsumed:
             pytest.param("x='one  two'; declare a=$x; declare -p a", "", id="declaration-assignment"),
             pytest.param("x='one  two'; case $x in 'one  two') printf match;; esac", "", id="case-subject"),
             pytest.param("x='one  two'; cat <<<$x", "", id="here-string"),
-            pytest.param("env -- /usr/bin/printf '%s' -S", "", id="env-after-options"),
-            pytest.param("env -aS /usr/bin/printf option-operand", "", id="env-option-operand"),
+            pytest.param("env -- /usr/bin/printf '%s' -S", "prefix shape", id="env-after-options"),
+            pytest.param("env -aS /usr/bin/printf option-operand", "prefix shape", id="env-option-operand"),
         ],
     )
     def test_pin_reader_round_ten(self, content: str, group: str) -> None:
@@ -1059,49 +1001,67 @@ class TestVersionPinsConsumed:
             _pins_read(content, "round-ten.sh", {"PIN"})
 
     @pytest.mark.parametrize(
-        ("content", "group"),
+        ("content", "refused_prefix"),
         [
-            pytest.param("""env --split-str '/usr/bin/printenv P"I"N'""", "split string", id="env-split-str"),
-            pytest.param("""env --split '/usr/bin/printenv P"I"N'""", "split string", id="env-split"),
-            pytest.param("""env --sp='/usr/bin/printenv P"I"N'""", "split string", id="env-sp-attached"),
-            pytest.param("""env X-Y=1 env -S '/usr/bin/printenv P"I"N'""", "split string", id="env-punctuated-name"),
-            pytest.param("""env 'a b=1' env -S '/usr/bin/printenv P"I"N'""", "split string", id="env-space-in-name"),
-            pytest.param("""env =x env -S '/usr/bin/printenv P"I"N'""", "split string", id="env-empty-name"),
-            pytest.param("""x='/usr/bin/printenv P"I"N'; env -S"$x" """, "split string", id="env-short-attached"),
-            pytest.param("""env -uX -S '/usr/bin/printenv P"I"N'""", "split string", id="env-unset-cluster"),
-            pytest.param("""sudo env -S '/usr/bin/printenv P"I"N'""", "split string", id="sudo-env"),
+            pytest.param("""set --; env -a "$@" runner env -S '/usr/bin/printenv P"I"N'""", "env", id="env-argv0-at"),
             pytest.param(
-                """sudo X-Y=1 --preserve-env env -S '/usr/bin/printenv P"I"N'""",
-                "split string",
-                id="sudo-assignment-and-option",
+                """set --; exec -a "$@" runner env -S '/usr/bin/printenv P"I"N'""", "exec", id="exec-argv0-at"
             ),
-            pytest.param("""exec env -S '/usr/bin/printenv P"I"N'""", "split string", id="exec-env"),
+            pytest.param("""set --; timeout -- "$@" 1 env -S '/usr/bin/printenv P"I"N'""", "timeout", id="timeout-at"),
             pytest.param(
-                """env --default-signal env -S '/usr/bin/printenv P"I"N'""", "split string", id="env-optional"
+                """set -- runner env; env X="$@" -S '/usr/bin/printenv P"I"N'""", "env", id="env-assignment-at"
+            ),
+            pytest.param("""sudo TOOL=env -s '$TOOL' -S '/usr/bin/printenv P"I"N'""", "sudo", id="sudo-short-shell"),
+            pytest.param("""sudo TOOL=env -i '$TOOL' -S '/usr/bin/printenv P"I"N'""", "sudo", id="sudo-short-login"),
+            pytest.param(
+                """sudo TOOL=env --shell '$TOOL' -S '/usr/bin/printenv P"I"N'""", "sudo", id="sudo-long-shell"
             ),
             pytest.param(
-                """timeout --kill-a 1 5 env -S '/usr/bin/printenv P"I"N'""",
-                "split string",
-                id="timeout-abbreviated",
+                """sudo TOOL=env --login '$TOOL' -S '/usr/bin/printenv P"I"N'""", "sudo", id="sudo-long-login"
             ),
-            pytest.param("env --d /usr/bin/true", "unresolved option", id="env-ambiguous"),
-            pytest.param("env --imago-unknown /usr/bin/true", "unresolved option", id="env-unknown"),
-            pytest.param("exec --imago-unknown /usr/bin/true", "unresolved option", id="exec-no-long-options"),
-            pytest.param("env --arg -S /usr/bin/printf x", "", id="env-argv0-abbreviated"),
-            pytest.param("env --argv0=x /usr/bin/true", "", id="env-argv0-attached"),
-            pytest.param("env --unset=PIN /usr/bin/true", "", id="env-unset-long"),
-            pytest.param("timeout --kill-after=1 5 /usr/bin/true", "", id="timeout-kill-after"),
-            pytest.param("env -i /usr/bin/true", "", id="env-ignore-environment"),
+            pytest.param("env --ignore-environment=1 /usr/bin/printf x", "env", id="env-switch-value"),
+            pytest.param("""env --help env -S '/usr/bin/printenv P"I"N'""", "env", id="env-help"),
+            pytest.param("""env --version env -S '/usr/bin/printenv P"I"N'""", "env", id="env-version"),
+            pytest.param("""timeout --version 1 env -S '/usr/bin/printenv P"I"N'""", "timeout", id="timeout-version"),
+            pytest.param("""nohup --help env -S '/usr/bin/printenv P"I"N'""", "nohup", id="nohup-help"),
+            pytest.param('x=X; env -- "${x}=1" /usr/bin/printenv X', "env", id="env-expanded-name"),
+            pytest.param("""sudo -h --preserve-env env -S '/usr/bin/printenv P"I"N'""", "sudo", id="sudo-help"),
+            pytest.param("""sudo -p -- VAR=1 env -S '/usr/bin/printenv P"I"N'""", "sudo", id="sudo-prompt"),
+            pytest.param('set -- /usr/bin/true; sudo "$@"', "sudo", id="sudo-at"),
+            pytest.param('a=(/usr/bin/true); sudo "${a[@]}"', "sudo", id="sudo-array"),
+            pytest.param('v=1; sudo X="$v" cmd', "sudo", id="sudo-expanded-assignment"),
+            pytest.param("sudo X-Y=1 /usr/bin/true", "sudo", id="sudo-invalid-assignment"),
+            pytest.param("sudo X=1", "sudo", id="sudo-missing-command"),
+            pytest.param("sudo t['r']u[e]", "sudo", id="sudo-quoted-glob"),
+            pytest.param("sudo X={a,'b'} /usr/bin/true", "sudo", id="sudo-quoted-brace"),
+            pytest.param("""sudo env -S '/usr/bin/printenv P"I"N'""", "env", id="sudo-env"),
+            pytest.param("""exec env -S '/usr/bin/printenv P"I"N'""", "env", id="exec-env"),
+            pytest.param("command cmd", "command", id="command-without-v"),
+            pytest.param("command -v", "command", id="command-missing-operand"),
+            pytest.param('x=true; command -v "$x"', "command", id="command-expanded-operand"),
+            pytest.param("command -v -- true", "command", id="command-extra-option"),
+            pytest.param("command -V true", "command", id="command-uppercase-v"),
+            pytest.param("/usr/bin/command -v true", "command", id="command-path"),
+            pytest.param("builtin cmd", "builtin", id="builtin"),
+            pytest.param("env /usr/bin/true", "env", id="env"),
+            pytest.param("/usr/bin/env /usr/bin/true", "env", id="env-path"),
+            pytest.param("timeout 1 /usr/bin/true", "timeout", id="timeout"),
+            pytest.param("nohup cmd", "nohup", id="nohup"),
+            pytest.param("exec >/dev/null", "exec", id="exec-redirection-only"),
+            pytest.param("sudo apt-get update", "", id="sudo-command"),
+            pytest.param("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y x", "", id="sudo-literal-assignment"),
+            pytest.param('sudo X="fixed text" Y= /usr/bin/true', "", id="sudo-multiple-literal-assignments"),
+            pytest.param("exec /usr/bin/true", "", id="exec-command"),
+            pytest.param("command -v nvidia-ctk", "", id="command-v"),
+            pytest.param("command -v true false", "", id="command-v-multiple"),
         ],
     )
-    def test_pin_reader_prefix_options(self, content: str, group: str) -> None:
-        # Track a different name so the literal PIN in --unset exercises only option handling.
-        pins = {"TRACKED"}
-        if not group:
-            assert _pins_read(content, "prefix.sh", pins) == set()
+    def test_pin_reader_closed_prefix_shapes(self, content: str, refused_prefix: str) -> None:
+        if not refused_prefix:
+            assert _pins_read(content, "prefix.sh", {"PIN"}) == set()
             return
-        with pytest.raises(PinRefusal, match=rf"(?m)^prefix\.sh:\d+: \[{group}\] .+ at File\.Stmts"):
-            _pins_read(content, "prefix.sh", pins)
+        with pytest.raises(PinRefusal, match=rf"(?m)^prefix\.sh:\d+: \[prefix shape\] {refused_prefix} at File\.Stmts"):
+            _pins_read(content, "prefix.sh", {"PIN"})
 
     def test_pin_reader_redirect_scope(self) -> None:
         contents = (

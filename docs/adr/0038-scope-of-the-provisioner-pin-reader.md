@@ -16,9 +16,9 @@ Use the pin reader (`tests/test_version_pins_consumed.py`) as a tripwire for its
 
 Refuse arithmetic, indirection, dynamic variable names and dynamic code in the listed constructs. Require literal command names, including after the listed prefixes, and literal words in the option and operator positions that select names or code. Refuse the `eval` builtin and extended glob patterns regardless of the names they contain.
 
-Refuse unquoted parameter, command, arithmetic and process expansions in simple command words, loop word lists, array literal elements and non-assignment declaration words. Bash can split unquoted expansions into run-time words in these positions. Refuse `env -S` and `env --split-string`, including clustered short options and literal values, because `env` splits and expands the value itself.
+Refuse unquoted parameter, command, arithmetic and process expansions in simple command words, loop word lists, array literal elements and non-assignment declaration words. Bash can split unquoted expansions into run-time words in these positions.
 
-Resolve long options using each prefix command's getopt rules, refuse unknown or ambiguous options, and treat any `env` operand containing `=` before the command as an assignment.
+Accept only the prefix shapes the provisioners use (`sudo` with optional literal `NAME=value` words and a literal command, `exec` with a literal command, and `command -v` with literal operands) and refuse every other prefix shape by name.
 
 Alias and function shadowing of command names are outside the tripwire's scope.
 
