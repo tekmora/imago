@@ -111,6 +111,9 @@ func resolveManifestPin(document map[string]any, keyPath string) (string, error)
 	if !ok {
 		return "", fmt.Errorf("manifest pin must be a string, got %T", value)
 	}
+	if pin == "" {
+		return "", fmt.Errorf("%s must not be empty", keyPath)
+	}
 	return pin, nil
 }
 

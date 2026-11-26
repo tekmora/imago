@@ -28,6 +28,7 @@ import yaml
 
 from tests.harness.live import skip_or_fail
 from tests.harness.mock_runner import GIT_BASH, MockSandbox
+from tests.test_apply_required_pins import GOLDEN, _apply_blocks
 from tests.test_provisioners_execution import check_bash
 from tests.test_version_pins_consumed import PIN_ENV_PATH, get_common_env_names, manifest_pin_values
 
@@ -220,7 +221,8 @@ _ALIAS_ASSIGNMENT = re.compile(
 
 
 def _pins_and_aliases(content: str, pins: Collection[str]) -> set[str]:
-    assignments = [(match["target"], match["bare"] or match["braced"]) for match in _ALIAS_ASSIGNMENT.finditer(content)]
+    code = "".join(line for line in content.splitlines(keepends=True) if not line.lstrip().startswith("#"))
+    assignments = [(match["target"], match["bare"] or match["braced"]) for match in _ALIAS_ASSIGNMENT.finditer(code)]
     names = set(pins)
     for _ in assignments:
         aliases = {target for target, source in assignments if source in names} - names
@@ -277,6 +279,10 @@ def test_provisioners_hold_no_direct_pin_fallbacks(tmp_path: Path) -> None:
         pytest.param("helper.sh", 'declare a="${PIN}"\n', 'echo "${a=value}"', True, id="declare-alias"),
         pytest.param("helper.sh", 'x="$OTHER"; ', 'echo "${x:-value}"', False, id="non-pin-alias"),
         pytest.param("helper.sh", 'x="${PIN:?message}"\n', 'echo "${x}"', False, id="required-read"),
+        pytest.param("helper.sh", '# a="$PIN"\n', 'echo "${a:-value}"', False, id="full-line-comment"),
+        pytest.param("helper.sh", '  # a="$PIN"\n', 'echo "${a:-value}"', False, id="indented-comment"),
+        pytest.param("helper.sh", 'a="$PIN" # note\n', 'echo "${a:-value}"', True, id="inline-comment"),
+        pytest.param("helper.sh", "#!/usr/bin/env bash\n", 'echo "${a:-value}"', False, id="shebang"),
     ],
 )
 def test_provisioners_hold_no_pin_fallbacks(
@@ -349,6 +355,101 @@ def test_packer_common_env_refuses_missing_manifest_pin(tmp_path: Path) -> None:
     result = packer_common_env(tmp_path, manifest)
     assert result.returncode != 0, result.stdout
     assert "common_env" in result.stdout + result.stderr
+
+
+_HCL_OPAQUE = re.compile(r'"(?:\\[^\n]|[^"\\\n])*"|#[^\n]*|//[^\n]*|/\*.*?\*/|(?P<unreadable>"|/\*|<<)', re.S)
+_COMMON_ENV = re.compile(r"(?<![\w.-])local\s*\.\s*common_env(?![\w-])")
+
+
+def _hcl_layout(content: str) -> str:
+    def mask(token: re.Match[str]) -> str:
+        assert not token["unreadable"], f"unreadable HCL at offset {token.start()}: {token[0]!r}"
+        return re.sub(r"[^\n]", " ", token[0])
+
+    return _HCL_OPAQUE.sub(mask, content)
+
+
+def _hcl_blocks(content: str, header: str) -> list[str]:
+    depth = 0
+    start = None
+    blocks = []
+    for brace in re.finditer(r"[{}]", _hcl_layout(content)):
+        if brace[0] == "{":
+            if depth == 0:
+                line_start = content.rfind("\n", 0, brace.start()) + 1
+                label = content[line_start : brace.start()].strip()
+                start = brace.end() if re.fullmatch(header, label) else None
+            depth += 1
+        else:
+            depth -= 1
+            assert depth >= 0, f"unmatched HCL closing brace at offset {brace.start()}"
+            if depth == 0 and start is not None:
+                blocks.append(content[start : brace.start()])
+    assert depth == 0, f"unclosed HCL block while reading {header}"
+    return blocks
+
+
+def _hcl_environment_expression(shell: str) -> str:
+    layout = _hcl_layout(shell)
+    assert (attribute := re.search(r"(?m)^[ \t]*environment_vars[ \t]*=[ \t]*", layout)), (
+        "no environment_vars attribute"
+    )
+    expression = layout[attribute.end() :]
+    depth = 0
+    for token in re.finditer(r"[({\[)}\]\n]", expression):
+        if token[0] in "([{":
+            depth += 1
+        elif token[0] in ")]}":
+            depth -= 1
+        elif depth == 0:
+            return expression[: token.start()]
+        assert depth >= 0, "unbalanced environment_vars expression"
+    assert depth == 0, "unbalanced environment_vars expression"
+    return expression
+
+
+def _assert_build_common_env(content: str) -> set[str]:
+    names = set()
+    for build in _hcl_blocks(content, r"build"):
+        name = json.loads(hcl_attribute(build, "name"))
+        assert isinstance(name, str) and name and name not in names, f"invalid or duplicate build name: {name!r}"
+        names.add(name)
+        shells = _hcl_blocks(build, r'provisioner[ \t]+"shell"')
+        assert shells, f"{name}: no shell provisioner"
+        for index, shell in enumerate(shells, 1):
+            try:
+                assert _COMMON_ENV.search(_hcl_environment_expression(shell)), "environment_vars omits local.common_env"
+            except AssertionError as error:
+                raise AssertionError(f"{name}: shell provisioner {index}: {error}") from error
+    return names
+
+
+def test_every_packer_build_wires_common_env() -> None:
+    actual = _assert_build_common_env((PACKER / "builds.pkr.hcl").read_text(encoding="utf-8"))
+    expected = {block.flavor for block in _apply_blocks(GOLDEN.read_text(encoding="utf-8"))}
+    assert len(expected) == 44
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "diagnostic"),
+    [
+        pytest.param(
+            'provisioner "shell" {\n    environment_vars = ["local.common_env"] # local.common_env\n  }',
+            "planted: shell provisioner 1: environment_vars omits local.common_env",
+            id="missing-common-env",
+        ),
+        pytest.param('provisioner "file" {}', "planted: no shell provisioner", id="no-shell"),
+        pytest.param(
+            'provisioner "shell" {\n    environment_vars = local.common_env',
+            "unclosed HCL block",
+            id="unclosed-block",
+        ),
+    ],
+)
+def test_build_common_env_refuses_bad_wiring(body: str, diagnostic: str) -> None:
+    with pytest.raises(AssertionError, match=re.escape(diagnostic)):
+        _assert_build_common_env(f'build {{\n  name = "planted"\n  {body}\n}}\n')
 
 
 def test_every_image_read_by_precache_is_passed_by_build() -> None:
