@@ -41,7 +41,7 @@ Across the reference repositories, the stable architectural pattern is:
 | **Trunk-Based PR Merge Flow** | **Adopted** | Protected `main`, branch protection requiring `required-checks`, squash/rebase only |
 | **Pinned GitHub Actions** | **Adopted** | All 26 actions in `.github/workflows/` pinned to 40-character commit SHAs |
 | **Conventional Commits** | **Adopted** | `type(scope): subject` syntax enforced via PR titles and release automation |
-| **Semantic Versioning (Release Please)** | **Adopted** | `release-please` is configured. Opening a new release pull request waits for issue #256. |
+| **Semantic Versioning (Release Please)** | **Adopted** | `release-please` is configured. Opening a new release pull request and merging #58 wait for the release app migration in issue #256. The [release procedure](operations/maintenance-cadence.md#31-tasks-procedures) checks the published assets and signed checksums. |
 | **Append-Only ADRs** | **Adopted** | [`docs/adr/`](adr/README.md) following standardized format |
 | **Material for MkDocs Portal** | **Adopted** | `mkdocs build --strict` deploying to GitHub Pages via [`pages.yml`](https://github.com/cordanaLLM/imago/blob/main/.github/workflows/pages.yml) |
 | **Privacy & Zero-Leak Invariant** | **Adopted** | Strict prohibition on RFC 1918 IPs and `/home/*` paths (`test_no_private_ips_or_user_paths`) |

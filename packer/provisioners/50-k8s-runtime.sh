@@ -5,11 +5,11 @@
 # Complies with NASA/JPL Power of 10: short functions (<= 60 lines), checked returns.
 set -euo pipefail
 
-K8S_MAJOR_MINOR="${K8S_MAJOR_MINOR:-1.37}"
-K8S_VERSION="${K8S_VERSION:?K8S_VERSION must come from versions.json}"
-CRUN_VERSION="${CRUN_VERSION:?CRUN_VERSION must come from versions.json}"
-IMG_PAUSE="${IMG_PAUSE:-registry.k8s.io/pause:3.10}"
-CDEBUG_VERSION="${CDEBUG_VERSION:?CDEBUG_VERSION must come from versions.json}"
+kubernetes_channel="${K8S_MAJOR_MINOR:-1.37}"
+: "${K8S_VERSION:?K8S_VERSION must come from versions.json}"
+: "${CRUN_VERSION:?CRUN_VERSION must come from versions.json}"
+pause_image="${IMG_PAUSE:-registry.k8s.io/pause:3.10}"
+: "${CDEBUG_VERSION:?CDEBUG_VERSION must come from versions.json}"
 
 setup_containerd() {
   echo "==> Installing and configuring containerd 2.3+ with CRI and crun..."
@@ -21,7 +21,7 @@ setup_containerd() {
 
   # Enable systemd cgroup driver and set pause sandbox image
   sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-  sudo sed -i "s|sandbox_image = .*|sandbox_image = \"${IMG_PAUSE}\"|" /etc/containerd/config.toml
+  sudo sed -i "s|sandbox_image = .*|sandbox_image = \"${pause_image}\"|" /etc/containerd/config.toml
   sudo sed -i 's/discard_unpacked_layers = false/discard_unpacked_layers = true/' /etc/containerd/config.toml
 
   # Register crun as alternative high-performance OCI runtime class (containerd 2.x & 1.x compatible)
@@ -74,12 +74,12 @@ verify_crun_version() {
 }
 
 setup_kubernetes_packages() {
-  echo "==> Setting up Kubernetes official repository (v${K8S_MAJOR_MINOR})..."
+  echo "==> Setting up Kubernetes official repository (v${kubernetes_channel})..."
   sudo mkdir -p -m 755 /etc/apt/keyrings
-  curl -fsSL --max-time 30 "https://pkgs.k8s.io/core:/stable:/v${K8S_MAJOR_MINOR}/deb/Release.key" |
+  curl -fsSL --max-time 30 "https://pkgs.k8s.io/core:/stable:/v${kubernetes_channel}/deb/Release.key" |
     sudo gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
-  echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_MAJOR_MINOR}/deb/ /" |
+  echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${kubernetes_channel}/deb/ /" |
     sudo tee /etc/apt/sources.list.d/kubernetes.list
 
   sudo apt-get update

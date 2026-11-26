@@ -38,7 +38,9 @@ Execute this checklist before merging release pull request or cutting new tag.
    ```
 
 5. **`release-please` Status**:
-   New release pull requests wait for the release app migration in issue #256.
+   New release pull requests and #58 merge wait on release app migration, issue #256.
+   Check published assets and signed checksums per monthly release procedure in
+   `docs/operations/maintenance-cadence.md`.
    List open pull requests labeled `autorelease: pending`.
 
    ```bash

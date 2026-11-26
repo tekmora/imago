@@ -9,14 +9,14 @@ set -euo pipefail
 : "${ROCM_VERSION:?ROCM_VERSION must come from versions.json}"
 : "${ROCM_REPO:?ROCM_REPO must come from versions.json}"
 : "${ROCM_APT_SUITE:?ROCM_APT_SUITE must come from versions.json}"
-DISTRO_RELEASE="${DISTRO_RELEASE:-resolute}"
+ubuntu_release="${DISTRO_RELEASE:-resolute}"
 
 setup_rocm_repository() {
   echo "==> Configuring AMD ROCm apt repository (v${ROCM_VERSION}, suite ${ROCM_APT_SUITE})..."
   # AMD publishes ROCm for jammy and noble only. On another release the image uses the
   # suite from versions.json and says so, instead of a suite AMD does not publish.
-  if [ "${ROCM_APT_SUITE}" != "${DISTRO_RELEASE}" ]; then
-    echo "    Note: Ubuntu ${DISTRO_RELEASE} uses the ROCm ${ROCM_APT_SUITE} packages."
+  if [ "${ROCM_APT_SUITE}" != "${ubuntu_release}" ]; then
+    echo "    Note: Ubuntu ${ubuntu_release} uses the ROCm ${ROCM_APT_SUITE} packages."
   fi
   sudo mkdir -p -m 755 /etc/apt/keyrings
   curl -fsSL --max-time 30 "${ROCM_REPO}/rocm.gpg.key" |

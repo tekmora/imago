@@ -5,8 +5,7 @@
 # Complies with NASA/JPL Power of 10: short functions (<= 60 lines), checked returns.
 set -euo pipefail
 
-CDEBUG_VERSION="${CDEBUG_VERSION:-0.0.19}"
-CRUN_VERSION="${CRUN_VERSION:?CRUN_VERSION must come from versions.json}"
+: "${CRUN_VERSION:?CRUN_VERSION must come from versions.json}"
 
 install_podman_packages() {
   echo "==> Installing Podman, Buildah, Skopeo, Netavark, and crun on Ubuntu 26.04..."

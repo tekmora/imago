@@ -5,17 +5,17 @@
 # Complies with NASA/JPL Power of 10: short functions (<= 60 lines), checked returns.
 set -euo pipefail
 
-DISTRO_RELEASE="${DISTRO_RELEASE:-resolute}"
+ubuntu_release="${DISTRO_RELEASE:-resolute}"
 
 setup_docker_repository() {
-  echo "==> Configuring official Docker apt repository on Ubuntu ${DISTRO_RELEASE}..."
+  echo "==> Configuring official Docker apt repository on Ubuntu ${ubuntu_release}..."
   sudo mkdir -p -m 755 /etc/apt/keyrings
   curl -fsSL --max-time 30 https://download.docker.com/linux/ubuntu/gpg |
     sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
 
   local arch
   arch="$(dpkg --print-architecture)"
-  echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${DISTRO_RELEASE} stable" |
+  echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${ubuntu_release} stable" |
     sudo tee /etc/apt/sources.list.d/docker.list
 
   sudo apt-get update || echo "    Warning: apt update returned non-zero, continuing..."

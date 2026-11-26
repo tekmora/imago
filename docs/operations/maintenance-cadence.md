@@ -45,9 +45,13 @@ The monthly cadence is overseen by release maintainers following standard SOPs:
 
 1. **Release Milestone Cut**:
    - The `release-please` workflow is configured for pushes to `main`. Opening a new release
-     pull request waits for the release app migration tracked in issue #256. Until then,
-     open pull request #58 (`chore(main): release 0.1.0`) is the release pull request to
-     review and merge once the `0.1.0 — First release` milestone is complete.
+     pull request and merging pull request #58 (`chore(main): release 0.1.0`) both wait for
+     the release app migration tracked in issue #256. Review #58 while the migration is
+     pending and merge it once the migration and the `0.1.0 — First release` milestone are
+     complete.
+   - A release created with the default workflow token (`GITHUB_TOKEN`) does not trigger the `release: published`
+     run of `release-matrix.yml`. A manual run builds and smoke-tests one flavor,
+     and `release-build.yml` uploads release assets and signs the checksums only for a release event.
    - Review the next `CHANGELOG.md` section, the `VERSION` file and the version constant
      in `cmd/imago/main.go` before merging. After merging, verify that the `release-please`
      workflow tagged the merge commit `vX.Y.Z` and created the GitHub release. The first release is `v0.1.0`
@@ -55,6 +59,27 @@ The monthly cadence is overseen by release maintainers following standard SOPs:
      `0.1.0 — First release` names; `tests/test_governance.py` refuses any later version
      while that milestone is open. Later versions follow from the
      Conventional Commits merged since the last tag.
+   - List the published assets with `gh release view vX.Y.Z --json assets` in the releasing fork.
+     For each release flavor (`base-generic`, `docker-generic` and `k8s-node-generic`), check for
+     `imago-cloud-<flavor>.qcow2.zst`, `imago-cloud-<flavor>.raw.zst`, and
+     `provenance-<flavor>.sigstore.json`. Also check for `sbom-<flavor>.cdx.json`,
+     `sbom-<flavor>.spdx.json`, `<flavor>-netboot.vmlinuz`, `<flavor>-netboot.initrd`,
+     `<flavor>-root.squashfs` and `<flavor>.ipxe`. For a split asset, check the uploaded
+     `.part00`, `.part01`, and subsequent parts listed in `SHA256SUMS` in place of the whole file.
+   - Check that the release lists `SHA256SUMS` and `SHA256SUMS.bundle`. Download both and
+     require `cosign verify-blob` to succeed with the release workflow's certificate identity
+     at the tag ref. Set `REPO` to the releasing fork and `TAG` to the release tag.
+
+     ```bash
+     REPO=your-owner/imago
+     TAG=vX.Y.Z
+     gh release download "${TAG}" --repo "${REPO}" --pattern SHA256SUMS --pattern SHA256SUMS.bundle
+     cosign verify-blob --bundle SHA256SUMS.bundle \
+       --certificate-identity "https://github.com/${REPO}/.github/workflows/release-build.yml@refs/tags/${TAG}" \
+       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+       SHA256SUMS
+     ```
+
    - The repository and organisation keep Actions pull request creation and approval off.
      `.standards.yaml` declares `allow_create_and_approve_pull_requests: false` under
      `overrides.actions`, and the online `praetorctl audit` fails when the forge value drifts.
