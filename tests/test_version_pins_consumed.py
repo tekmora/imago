@@ -79,6 +79,8 @@ _CONSTRUCT_REFUSALS = {
     "dynamic code": "the code word must be fully literal",
     "dynamic command": "the command name must be fully literal",
     "dynamic option": "an option or test operator word must be fully literal",
+    "unquoted expansion": "Bash splits the result into words at run time",
+    "split string": "env re-splits and expands the value itself",
     "eval": "eval reparses its arguments as shell code",
     "extglob": "extended glob patterns are outside the reader's word rules",
 }
@@ -137,6 +139,8 @@ _UNTYPED_KINDS = {
     "Redirs": "Redirect",
     "Exp": "Expansion",
 }
+_SPLITTING_WORD_EDGES = {("CallExpr", "Args"), ("WordIter", "Items"), ("ArrayElem", "Value")}
+_UNQUOTED_EXPANSIONS = {"ParamExp", "CmdSubst", "ArithmExp", "ProcSubst"}
 
 
 def get_common_env_names() -> list[str]:
@@ -415,6 +419,8 @@ def _invoked_command(words: list[Node]) -> tuple[str, list[Node], list[Violation
         options, remaining, dynamic_option = _take_options(command, values)
         if dynamic_option:
             violations.append(("dynamic option", f"{command} options"))
+        if command == "env" and options.keys() & {"S", "split-string"}:
+            violations.append(("split string", "env split-string option"))
         if command == "command" and options.keys() & {"v", "V"}:
             break
         skipped = len(words) - len(remaining)
@@ -566,6 +572,16 @@ def _ast_violations(node: Node, kind: str, source: bytes) -> Iterator[Violation]
         yield from _call_violations(node)
 
 
+def _unquoted_expansion(node: Node, kind: str, chain: tuple[Edge, ...]) -> Node | None:
+    if kind == "Assign" and chain[-1] == ("DeclClause", "Args") and node.get("Naked"):
+        word = node.get("Value", {})
+    elif kind == "Word" and chain[-1] in _SPLITTING_WORD_EDGES:
+        word = node
+    else:
+        return None
+    return next((part for part in word.get("Parts", ()) if part["Type"] in _UNQUOTED_EXPANSIONS), None)
+
+
 def _pin_mentions(node: Node, kind: str, chain: tuple[Edge, ...], pins: Set[str]) -> Iterator[tuple[str, int, str]]:
     if kind == "ParamExp" and (name := node["Param"]["Value"]) in pins:
         modifiers = sorted(node.keys() - _PARAMETER_METADATA - {"Dollar"})
@@ -599,6 +615,11 @@ def _pins_read(content: str, filename: str, pins: Set[str]) -> set[str]:
     source = content.encode("utf-8")
     for node, kind, chain, allowed, inert in _walk_script(_parse_script(source, filename)):
         route = " > ".join(f"{parent}.{field}" for parent, field in chain)
+        if (part := _unquoted_expansion(node, kind, chain)) is not None:
+            refusals.append(
+                f"{filename}:{part['Pos']['Line']}: [unquoted expansion] {part['Type']} at {route}: "
+                f"{_CONSTRUCT_REFUSALS['unquoted expansion']}"
+            )
         for group, construct in _ast_violations(node, kind, source):
             location = node["Args"][0] if kind == "CallExpr" else node
             line = location["Pos"]["Line"]
@@ -675,7 +696,7 @@ class TestVersionPinsConsumed:
             pytest.param("cat <<EOF\n${#PIN} ${!INDIRECT}\nEOF", "PIN", "INDIRECT", "PI", id="expanding-heredoc"),
             pytest.param('echo "${#PIN}" "${!OTHER_PIN}"', "PIN", "OTHER_PIN", "PI OTHER", id="parameter-operators"),
             pytest.param("echo '${#PIN} ${!OTHER_PIN}'", "", "PIN OTHER_PIN", "", id="literal-parameter-operators"),
-            pytest.param("echo word\\\n#$PIN # $COMMENT", "PIN", "", "COMMENT", id="continued-word"),
+            pytest.param('echo word\\\n#"$PIN" # $COMMENT', "PIN", "", "COMMENT", id="quoted-continued-word"),
             pytest.param('echo "$PI\\\nN"', "PIN", "", "PI", id="continued-parameter"),
             pytest.param("echo word \\\n# $PIN", "", "", "PIN", id="continued-before-comment"),
             pytest.param('echo "${!PIN*}"', "", "PIN", "", id="prefix-names-star"),
@@ -909,6 +930,65 @@ class TestVersionPinsConsumed:
             return
         with pytest.raises(PinRefusal, match=rf"(?m)^round-nine\.sh:\d+: \[{group}\] .+ at File\.Stmts"):
             _pins_read(content, "round-nine.sh", {"PIN"})
+
+    @pytest.mark.parametrize(
+        ("content", "group"),
+        [
+            pytest.param("x='/usr/bin/printf env-short'; env -S \"$x\"", "split string", id="env-short"),
+            pytest.param("x='/usr/bin/printf env-long'; env --split-string=\"$x\"", "split string", id="env-long"),
+            pytest.param("env -S 'printf %s ${PIN}'", "split string", id="env-literal"),
+            pytest.param("x='/usr/bin/printf env-cluster'; env -vS \"$x\"", "split string", id="env-cluster"),
+            pytest.param(
+                "x='/usr/bin/printf env-separate'; env --split-string \"$x\"", "split string", id="env-long-separate"
+            ),
+            pytest.param(
+                "n='runner /usr/bin/printf exec=%s'; exec -a $n /usr/bin/true", "unquoted expansion", id="exec-argv0"
+            ),
+            pytest.param(
+                "d='1 /usr/bin/printf timeout=%s'; timeout -- $d /usr/bin/true",
+                "unquoted expansion",
+                id="timeout-duration",
+            ),
+            pytest.param("opt='extglob -c'; bash -O $opt 'printf x'", "unquoted expansion", id="bash-option"),
+            pytest.param('x=P; operand="-v ${x}IN"; test $operand', "unquoted expansion", id="test-operand"),
+            pytest.param('x=P; operand="-v ${x}IN"; [ $operand ]', "unquoted expansion", id="bracket-operand"),
+            pytest.param("y='x y'; [ x = $y ]", "unquoted expansion", id="bracket-value"),
+            pytest.param("x='one  two'; echo $x", "unquoted expansion", id="echo"),
+            pytest.param("echo word\\\n#$PIN # $COMMENT", "unquoted expansion", id="continued-word"),
+            pytest.param(
+                "list='one  two'; for w in $list; do :; done; printf '<%s>' \"$w\"", "unquoted expansion", id="for-list"
+            ),
+            pytest.param("x='one  two'; a=($x); declare -p a", "unquoted expansion", id="array"),
+            pytest.param("x='one  two'; declare -a a=($x); declare -p a", "unquoted expansion", id="declaration-array"),
+            pytest.param('x=/usr/bin/true; command -- "$x"', "dynamic command", id="command-after-dashes"),
+            pytest.param('x=/usr/bin/true; command "$x"', "dynamic command", id="command-without-dashes"),
+            pytest.param("z='a b'; declare $z; declare -p a b", "unquoted expansion", id="declaration-word"),
+            pytest.param("x='/usr/bin/printf command-name'; $x", "unquoted expansion", id="command-name"),
+            pytest.param('x="one  two"; printf "<%s>" "prefix "$x', "unquoted expansion", id="partly-quoted"),
+            pytest.param("echo $(printf 'one  two')", "unquoted expansion", id="command-substitution"),
+            pytest.param("echo $((1 + 1))", "unquoted expansion", id="arithmetic-expansion"),
+            pytest.param("cat <(printf process)", "unquoted expansion", id="process-substitution"),
+            pytest.param("n='runner /usr/bin/printf exec=%s'; exec -a \"$n\" /usr/bin/true", "", id="quoted-argv0"),
+            pytest.param("d='1 /usr/bin/printf timeout=%s'; timeout -- \"$d\" /usr/bin/true", "", id="quoted-duration"),
+            pytest.param('set -- one; [ "$#" -ne 2 ]', "", id="argument-count"),
+            pytest.param('x="one two"; [ -n "$x" ]', "", id="quoted-test"),
+            pytest.param("x=y; [[ $x == y ]]", "", id="double-bracket"),
+            pytest.param("y='one  two'; x=$y; printf '<%s>' \"$x\"", "", id="assignment"),
+            pytest.param('set -- "one  two"; for w in "$@"; do :; done; printf "<%s>" "$w"', "", id="quoted-for-list"),
+            pytest.param('x="one  two"; a=("$x"); declare -p a', "", id="quoted-array"),
+            pytest.param("x='one  two'; declare a=$x; declare -p a", "", id="declaration-assignment"),
+            pytest.param("x='one  two'; case $x in 'one  two') printf match;; esac", "", id="case-subject"),
+            pytest.param("x='one  two'; cat <<<$x", "", id="here-string"),
+            pytest.param("env -- /usr/bin/printf '%s' -S", "", id="env-after-options"),
+            pytest.param("env -aS /usr/bin/printf option-operand", "", id="env-option-operand"),
+        ],
+    )
+    def test_pin_reader_round_ten(self, content: str, group: str) -> None:
+        if not group:
+            assert _pins_read(content, "round-ten.sh", {"PIN"}) == set()
+            return
+        with pytest.raises(PinRefusal, match=rf"(?m)^round-ten\.sh:\d+: \[{group}\] .+ at File\.Stmts"):
+            _pins_read(content, "round-ten.sh", {"PIN"})
 
     def test_pin_reader_redirect_scope(self) -> None:
         contents = (
