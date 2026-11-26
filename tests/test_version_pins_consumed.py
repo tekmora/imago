@@ -47,6 +47,8 @@ _WORD_OPERATORS = _ERROR_OPERATORS | {":-", "-"}
 _STRING_TEST_OPERATORS = {"==", "=", "!=", "=~", "<", ">"}
 _UNARY_STRING_TEST_OPERATORS = {"-n", "-z"}
 _PARAMETER_METADATA = {"Type", "Pos", "End", "Rbrace", "Param"}
+# Bash expands bare @ and * across all array members without arithmetic.
+_ALL_MEMBERS_SUBSCRIPTS = {"@", "*"}
 
 type Edge = tuple[str, str]
 type Node = dict[str, Any]
@@ -230,8 +232,20 @@ def _walk_script(root: Node) -> Iterator[tuple[Node, str, tuple[Edge, ...], bool
                     pending.append((child, (*chain, edge), allowed_child, inert_child))
 
 
+def _all_members_subscript(index: Node) -> bool:
+    parts = index.get("Parts", ())
+    return (
+        index["Type"] == "Word"
+        and len(parts) == 1
+        and parts[0]["Type"] == "Lit"
+        and parts[0]["Value"] in _ALL_MEMBERS_SUBSCRIPTS
+    )
+
+
 def _supported_parameter(node: Node) -> bool:
     fields = node.keys() - _PARAMETER_METADATA
+    if "Index" in fields:
+        return fields in ({"Dollar", "Index"}, {"Dollar", "Index", "Length"}) and _all_members_subscript(node["Index"])
     return fields in ({"Dollar"}, {"Dollar", "Short"}, {"Dollar", "Length"}) or (
         fields == {"Dollar", "Exp"} and node["Exp"]["Op"] in _WORD_OPERATORS
     )
@@ -457,10 +471,14 @@ def _ast_violations(node: Node, kind: str) -> Iterator[Violation]:
         yield "arithmetic", kind
     if kind == "BinaryTest" and node["Op"] in _ARITHMETIC_TESTS:
         yield "arithmetic", f"[[ {node['Op']} ]]"
-    if kind in {"ParamExp", "Assign", "ArrayElem"}:
-        for field in ("Index", "Slice"):
-            if field in node:
-                yield "arithmetic", f"{kind}.{field}"
+    if (
+        kind in {"ParamExp", "Assign", "ArrayElem"}
+        and "Index" in node
+        and not (kind == "ParamExp" and _all_members_subscript(node["Index"]))
+    ):
+        yield "arithmetic", f"{kind}.Index"
+    if kind == "ParamExp" and "Slice" in node:
+        yield "arithmetic", "ParamExp.Slice"
     if kind == "ParamExp" and node.get("Excl"):
         yield "indirect", "ParamExp.Excl"
     if kind == "UnaryTest" and node["Op"] in _NAME_TESTS and not _plain_name(_command_word(node["X"])):
@@ -732,6 +750,35 @@ class TestVersionPinsConsumed:
             _pins_read(content, "round-eight.sh", {"PIN"})
         detail = "PIN: literal word" if expected == "literal word" else rf"\[{expected}\] .+"
         assert re.search(rf"^round-eight\.sh:\d+: {detail} at File\.Stmts", str(error.value), re.MULTILINE)
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            pytest.param('echo "${arr[@]}"', "", id="all-members-at"),
+            pytest.param('echo "${arr[*]}"', "", id="all-members-star"),
+            pytest.param('echo "${#arr[@]}"', "", id="all-members-length"),
+            pytest.param('for x in "${arr[@]}"; do :; done', "", id="all-members-loop"),
+            pytest.param('echo "${PIN[@]}"', "read", id="pin-array"),
+            pytest.param('echo "${arr[0]}"', "arithmetic ParamExp.Index", id="index-digit"),
+            pytest.param('echo "${arr[PIN]}"', "arithmetic ParamExp.Index", id="index-name"),
+            pytest.param('echo "${arr[$PIN]}"', "arithmetic ParamExp.Index", id="index-expansion"),
+            pytest.param('echo "${arr["@"]}"', "arithmetic ParamExp.Index", id="index-quoted-at"),
+            pytest.param('echo "${arr[1+1]}"', "arithmetic ParamExp.Index", id="index-arithmetic"),
+            pytest.param('echo "${arr[@]:PIN}"', "arithmetic ParamExp.Slice", id="slice-name"),
+            pytest.param('echo "${arr[@]:1:2}"', "arithmetic ParamExp.Slice", id="slice-literal"),
+            pytest.param("arr[PIN]=x", "arithmetic Assign.Index", id="assignment-index"),
+            pytest.param("arr=([PIN]=x)", "arithmetic ArrayElem.Index", id="array-element-index"),
+            pytest.param('echo "${!arr[@]}"', "indirect ParamExp.Excl", id="indirect-index-list"),
+        ],
+    )
+    def test_pin_reader_array_subscripts(self, content: str, expected: str) -> None:
+        if expected in {"", "read"}:
+            assert _pins_read(content, "array.sh", {"PIN"}) == ({"PIN"} if expected == "read" else set())
+            return
+        with pytest.raises(PinRefusal) as error:
+            _pins_read(content, "array.sh", {"PIN"})
+        constructs = re.findall(r"^array\.sh:\d+: \[(\w+)\] (\S+) at File\.Stmts", str(error.value), re.MULTILINE)
+        assert constructs == [tuple(expected.split())]
 
     def test_pin_reader_redirect_scope(self) -> None:
         contents = (
