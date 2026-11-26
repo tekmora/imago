@@ -12,7 +12,7 @@ The pin consumption test checks that the Packer environment pins have provisione
 
 ## Decision
 
-Use the [pin reader](../../tests/test_version_pins_consumed.py) as a tripwire for its listed read shapes and constructs. Refuse other pin mentions by name. Count an all-members array expansion only when the source bytes inside the brackets are exactly `@` or `*`.
+Use the pin reader (`tests/test_version_pins_consumed.py`) as a tripwire for its listed read shapes and constructs. Refuse other pin mentions by name. Count an all-members array expansion only when the source bytes inside the brackets are exactly `@` or `*`.
 
 Refuse arithmetic, indirection, dynamic variable names and dynamic code in the listed constructs. Require literal command names, including after the listed prefixes, and literal words in the option and operator positions that select names or code. Refuse the `eval` builtin and extended glob patterns regardless of the names they contain.
 
