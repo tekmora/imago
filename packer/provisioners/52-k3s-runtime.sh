@@ -38,13 +38,13 @@ install_k3s_binaries() {
     INSTALL_K3S_SKIP_ENABLE=true \
       INSTALL_K3S_SKIP_START=true \
       INSTALL_K3S_VERSION="${k3s_version}" \
-      sh "${install_script}"
+      sh -- "${install_script}"
   else
     INSTALL_K3S_SKIP_ENABLE=true \
       INSTALL_K3S_SKIP_START=true \
       INSTALL_K3S_VERSION="${k3s_version}" \
       INSTALL_K3S_EXEC="agent" \
-      sh "${install_script}"
+      sh -- "${install_script}"
   fi
 
   rm -f "${install_script}"

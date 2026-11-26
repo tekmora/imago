@@ -6,6 +6,7 @@ packer/builds.pkr.hcl is consumed by at least one shell provisioner, or has an
 explicit, unexpired exception entry in EXCEPTIONS.
 Also verifies build wiring for stargz-snapshotter (51) and enroot (62).
 
+The reader is a tripwire for the listed read shapes and constructs, not a proof; pin mentions outside the allow-list are refused by name.
 A read is an allow-listed expansion Bash performs whenever its statement
 executes. Statement selection (branches, command-level &&, function calls)
 is out of scope. Expression-level conditions (including || and && inside
@@ -48,7 +49,7 @@ _STRING_TEST_OPERATORS = {"==", "=", "!=", "=~", "<", ">"}
 _UNARY_STRING_TEST_OPERATORS = {"-n", "-z"}
 _PARAMETER_METADATA = {"Type", "Pos", "End", "Rbrace", "Param"}
 # Bash expands bare @ and * across all array members without arithmetic.
-_ALL_MEMBERS_SUBSCRIPTS = {"@", "*"}
+_ALL_MEMBERS_SUBSCRIPTS = {b"[@]", b"[*]"}
 
 type Edge = tuple[str, str]
 type Node = dict[str, Any]
@@ -76,11 +77,18 @@ _CONSTRUCT_REFUSALS = {
     "indirect": "indirection can resolve a variable name at runtime",
     "dynamic name": "the variable name must be one plain literal name",
     "dynamic code": "the code word must be fully literal",
+    "dynamic command": "the command name must be fully literal",
+    "dynamic option": "an option or test operator word must be fully literal",
+    "eval": "eval reparses its arguments as shell code",
+    "extglob": "extended glob patterns are outside the reader's word rules",
 }
 _DECLARATIONS = {"declare", "local", "typeset", "readonly", "export"}
 _REFERENCE_DECLARATIONS = {"declare", "local", "typeset"}
 _ARITHMETIC_TESTS = {"-eq", "-ne", "-lt", "-le", "-gt", "-ge"}
 _NAME_TESTS = {"-v", "-R"}
+_TEST_COMMANDS = {"[", "test"}
+_BINARY_TESTS = (_STRING_TEST_OPERATORS - {"=~"}) | _ARITHMETIC_TESTS | {"-a", "-o", "-nt", "-ot", "-ef"}
+_SHELL_COMMANDS = {"bash", "sh"}
 _MAPFILE_OPTIONS = set("dnOsuCc")
 _NAME_COMMANDS = {"[", "test", "printf", "getopts", "read", "mapfile", "readarray", "unset", "printenv"}
 _CODE_COMMANDS = {"eval", "trap", ".", "source", "bash", "sh", "mapfile", "readarray"}
@@ -105,6 +113,17 @@ _PREFIX_OPTIONS = {
     "builtin": set(),
     "nohup": set(),
     "timeout": {"k", "s", "kill-after", "signal"},
+}
+_OPTION_VALUES = {
+    **_PREFIX_OPTIONS,
+    ".": {"p"},
+    "source": {"p"},
+    "bash": {"O", "o", "+O", "+o", "init-file", "rcfile"},
+    "sh": {"O", "o", "+O", "+o", "init-file", "rcfile"},
+    "printf": {"v"},
+    "read": set("adinNptu"),
+    "mapfile": _MAPFILE_OPTIONS,
+    "readarray": _MAPFILE_OPTIONS,
 }
 
 # shfmt omits Type when the concrete child type is already known to its encoder.
@@ -132,15 +151,15 @@ def get_common_env_names() -> list[str]:
     return names
 
 
-def _parse_script(content: str, filename: str) -> Node:
+def _parse_script(source: bytes, filename: str) -> Node:
     shfmt = shutil.which("shfmt")
     if shfmt is None:
         pytest.fail(f"shfmt is missing from PATH for {filename}; install shfmt-py from .github/requirements/test.txt")
     result = subprocess.run(
-        [shfmt, "--to-json", "-ln", "bash"], input=content, capture_output=True, text=True, check=False, timeout=30
+        [shfmt, "--to-json", "-ln", "bash"], input=source, capture_output=True, check=False, timeout=30
     )
     if result.returncode != 0:
-        pytest.fail(f"shfmt could not parse {filename}: {result.stderr.strip()}")
+        pytest.fail(f"shfmt could not parse {filename}: {result.stderr.decode(errors='replace').strip()}")
     return json.loads(result.stdout)
 
 
@@ -232,20 +251,25 @@ def _walk_script(root: Node) -> Iterator[tuple[Node, str, tuple[Edge, ...], bool
                     pending.append((child, (*chain, edge), allowed_child, inert_child))
 
 
-def _all_members_subscript(index: Node) -> bool:
+def _all_members_subscript(node: Node, source: bytes) -> bool:
+    index = node["Index"]
     parts = index.get("Parts", ())
+    # The index node omits bracket whitespace, so check from the parameter through the closing bracket.
+    left = node["Param"]["End"]["Offset"]
+    right = index["End"]["Offset"]
     return (
         index["Type"] == "Word"
         and len(parts) == 1
         and parts[0]["Type"] == "Lit"
-        and parts[0]["Value"] in _ALL_MEMBERS_SUBSCRIPTS
+        and parts[0]["Value"] in {"@", "*"}
+        and source[left : right + 1] in _ALL_MEMBERS_SUBSCRIPTS
     )
 
 
-def _supported_parameter(node: Node) -> bool:
+def _supported_parameter(node: Node, source: bytes) -> bool:
     fields = node.keys() - _PARAMETER_METADATA
     if "Index" in fields:
-        return fields in ({"Dollar", "Index"}, {"Dollar", "Index", "Length"}) and _all_members_subscript(node["Index"])
+        return fields in ({"Dollar", "Index"}, {"Dollar", "Index", "Length"}) and _all_members_subscript(node, source)
     return fields in ({"Dollar"}, {"Dollar", "Short"}, {"Dollar", "Length"}) or (
         fields == {"Dollar", "Exp"} and node["Exp"]["Op"] in _WORD_OPERATORS
     )
@@ -339,23 +363,29 @@ def _option_fields(word: str) -> Iterator[tuple[str, str | None]]:
             yield key, word[position + 1 :] or None
 
 
-def _take_options(args: list[Argument], takes_value: Set[str]) -> tuple[dict[str, Argument | None], list[Argument]]:
+def _take_options(command: str, args: list[Argument]) -> tuple[dict[str, Argument | None], list[Argument], bool]:
     options: dict[str, Argument | None] = {}
+    takes_value = _OPTION_VALUES.get(command, set())
+    signs = ("-", "+") if command in _REFERENCE_DECLARATIONS | _SHELL_COMMANDS else ("-",)
+    dynamic_option = False
     index = 0
     while index < len(args):
         argument = args[index]
         dynamic = isinstance(argument, DynamicWord)
         word = argument.prefix if dynamic else argument
+        if dynamic and (not word or word.startswith(signs)):
+            dynamic_option = True
+        if not dynamic and (word == "--" or (word == "-" and command in _SHELL_COMMANDS)):
+            index += 1
+            break
         if (
             not word
             or word in {"-", "+"}
-            or word[0] not in "-+"
+            or not word.startswith(signs)
             or (dynamic and word.startswith("--") and "=" not in word)
         ):
             break
         index += 1
-        if word == "--":
-            break
         for flag, attached in _option_fields(word):
             if flag not in takes_value:
                 options[flag] = None
@@ -366,18 +396,25 @@ def _take_options(args: list[Argument], takes_value: Set[str]) -> tuple[dict[str
                 index += 1
             options[flag] = value
             break
-    return options, args[index:]
+    return options, args[index:], dynamic_option
 
 
-def _invoked_command(words: list[Node]) -> tuple[str, list[Node]]:
+def _invoked_command(words: list[Node]) -> tuple[str, list[Node], list[Violation]]:
+    violations: list[Violation] = []
+    prefix = ""
     while words:
         name = _command_word(words[0])
-        command = name.rsplit("/", 1)[-1] if isinstance(name, str) else ""
+        if isinstance(name, DynamicWord):
+            violations.append(("dynamic command", f"{prefix} command name" if prefix else "command name"))
+            break
+        command = name.rsplit("/", 1)[-1]
         words = words[1:]
         if command not in _PREFIX_OPTIONS:
-            return command, words
+            return command, words, violations
         values = [_command_word(word) for word in words]
-        options, remaining = _take_options(values, _PREFIX_OPTIONS[command])
+        options, remaining, dynamic_option = _take_options(command, values)
+        if dynamic_option:
+            violations.append(("dynamic option", f"{command} options"))
         if command == "command" and options.keys() & {"v", "V"}:
             break
         skipped = len(words) - len(remaining)
@@ -388,7 +425,8 @@ def _invoked_command(words: list[Node]) -> tuple[str, list[Node]]:
                 else:
                     break
         words = words[skipped + (command == "timeout") :]
-    return "", []
+        prefix = command
+    return "", [], violations
 
 
 def _plain_name(value: Argument | None) -> bool:
@@ -401,8 +439,9 @@ def _assignment_name(operand: Argument) -> str | None:
     return assignment[1] if assignment else None
 
 
-def _declaration_violations(command: str, args: list[Argument]) -> Iterator[Violation]:
-    flags, names = _take_options(args, set())
+def _declaration_violations(
+    command: str, flags: dict[str, Argument | None], names: list[Argument]
+) -> Iterator[Violation]:
     if "i" in flags:
         yield "arithmetic", f"{command} -i"
     if "n" in flags and command in _REFERENCE_DECLARATIONS:
@@ -411,81 +450,118 @@ def _declaration_violations(command: str, args: list[Argument]) -> Iterator[Viol
         yield "dynamic name", f"{command} -p" if "p" in flags else command
 
 
-def _name_operands(command: str, args: list[Argument]) -> Iterator[Argument | None]:
-    if command in {"[", "test"}:
+def _name_operands(command: str, flags: dict[str, Argument | None], args: list[Argument]) -> Iterator[Argument | None]:
+    if command in _TEST_COMMANDS:
         operands = args[:-1] if command == "[" and args[-1:] == ["]"] else args
         for operator, operand in zip(operands, operands[1:], strict=False):
             if operator in _NAME_TESTS:
                 yield operand
     elif command == "printf":
-        flags, operands = _take_options(args, {"v"})
         if "v" in flags:
             yield flags["v"]
-        elif operands and isinstance(operands[0], DynamicWord) and not operands[0].prefix:
-            yield operands[0]
+        elif args and isinstance(args[0], DynamicWord) and not args[0].prefix:
+            yield args[0]
     elif command == "getopts":
-        _, operands = _take_options(args, set())
-        yield from operands[1:2]
+        yield from args[1:2]
     elif command in {"read", "mapfile", "readarray", "unset", "printenv"}:
-        value_options = {"read": set("adinNptu"), "mapfile": _MAPFILE_OPTIONS, "readarray": _MAPFILE_OPTIONS}
-        flags, operands = _take_options(args, value_options.get(command, set()))
         if command == "read" and "a" in flags:
             yield flags["a"]
-        yield from operands
+        yield from args
 
 
-def _code_operands(command: str, args: list[Argument]) -> list[Argument | None]:
+def _code_operands(command: str, flags: dict[str, Argument | None], args: list[Argument]) -> list[Argument | None]:
     if command == "eval":
         return args
     if command == "trap":
-        flags, operands = _take_options(args, set())
-        return operands[:1] if not flags.keys() & {"l", "P", "p"} else []
+        return args[:1] if not flags.keys() & {"l", "P", "p"} else []
     if command in {".", "source"}:
-        flags, operands = _take_options(args, {"p"})
-        return ([flags["p"]] if "p" in flags else []) + operands[:1]
-    if command in {"bash", "sh"}:
-        flags, operands = _take_options(args, {"O", "o", "init-file", "rcfile"})
-        return operands[:1] if "c" in flags else []
+        return ([flags["p"]] if "p" in flags else []) + args[:1]
+    if command in _SHELL_COMMANDS:
+        return args[:1] if "c" in flags else []
     if command in {"mapfile", "readarray"}:
-        flags, _ = _take_options(args, _MAPFILE_OPTIONS)
         return [flags["C"]] if "C" in flags else []
     return []
 
 
+def _dynamic_test_operator(command: str, args: list[Argument]) -> bool:
+    if command == "[" and args:
+        if isinstance(args[-1], DynamicWord):
+            return True
+        if args[-1] == "]":
+            args = args[:-1]
+    # Bash reduces four-argument negation and parentheses to the fixed-arity forms.
+    if len(args) == 4:
+        if args[0] == "!":
+            args = args[1:]
+        elif args[0] == "(" and args[3] == ")":
+            args = args[1:3]
+    if len(args) < 2:
+        return False
+    if len(args) == 2:
+        return isinstance(args[0], DynamicWord)
+    if len(args) == 3:
+        first, second, third = args
+        if isinstance(second, DynamicWord):
+            return True
+        return second not in _BINARY_TESTS and (
+            isinstance(first, DynamicWord) or (first == "(" and isinstance(third, DynamicWord))
+        )
+    # Other four-argument forms and longer forms use Bash's precedence parser.
+    return any(isinstance(arg, DynamicWord) for arg in args)
+
+
+def _command_violations(command: str, args: list[Argument]) -> Iterator[Violation]:
+    if command in _TEST_COMMANDS:
+        if _dynamic_test_operator(command, args):
+            yield "dynamic option", f"{command} operator"
+        flags, operands = {}, args
+    elif command == "eval":
+        yield "eval", "eval"
+        flags, operands = {}, args
+    else:
+        flags, operands, dynamic_option = _take_options(command, args)
+        if dynamic_option:
+            yield "dynamic option", f"{command} options"
+    if command in _DECLARATIONS:
+        yield from _declaration_violations(command, flags, operands)
+    if any(not _plain_name(name) for name in _name_operands(command, flags, operands)):
+        yield "dynamic name", command
+    if any(not isinstance(code, str) for code in _code_operands(command, flags, operands)):
+        yield "dynamic code", f"{command} -c" if command in _SHELL_COMMANDS else command
+
+
 def _call_violations(node: Node) -> Iterator[Violation]:
-    command, words = _invoked_command(node.get("Args", []))
+    command, words, violations = _invoked_command(node.get("Args", []))
+    yield from violations
     if command == "let":
         yield "arithmetic", "let"
     if command in _DECLARATIONS | _NAME_COMMANDS | _CODE_COMMANDS:
-        args = [_command_word(word) for word in words]
-        if command in _DECLARATIONS:
-            yield from _declaration_violations(command, args)
-        if any(not _plain_name(name) for name in _name_operands(command, args)):
-            yield "dynamic name", command
-        if any(not isinstance(code, str) for code in _code_operands(command, args)):
-            yield "dynamic code", f"{command} -c" if command in {"bash", "sh"} else command
+        yield from _command_violations(command, [_command_word(word) for word in words])
 
 
-def _ast_violations(node: Node, kind: str) -> Iterator[Violation]:
+def _ast_violations(node: Node, kind: str, source: bytes) -> Iterator[Violation]:
     if kind in {"ArithmCmd", "ArithmExp", "LetClause", "CStyleLoop"}:
         yield "arithmetic", kind
+    # shfmt parses [[ ]] operators as syntax and rejects expansions in those positions.
     if kind == "BinaryTest" and node["Op"] in _ARITHMETIC_TESTS:
         yield "arithmetic", f"[[ {node['Op']} ]]"
     if (
         kind in {"ParamExp", "Assign", "ArrayElem"}
         and "Index" in node
-        and not (kind == "ParamExp" and _all_members_subscript(node["Index"]))
+        and not (kind == "ParamExp" and _all_members_subscript(node, source))
     ):
         yield "arithmetic", f"{kind}.Index"
     if kind == "ParamExp" and "Slice" in node:
         yield "arithmetic", "ParamExp.Slice"
     if kind == "ParamExp" and node.get("Excl"):
         yield "indirect", "ParamExp.Excl"
+    if kind == "ExtGlob":
+        yield "extglob", kind
     if kind == "UnaryTest" and node["Op"] in _NAME_TESTS and not _plain_name(_command_word(node["X"])):
         yield "dynamic name", f"[[ {node['Op']} ]]"
     if kind == "DeclClause":
         args = [arg["Name"]["Value"] if "Name" in arg else _command_word(arg["Value"]) for arg in node.get("Args", ())]
-        yield from _declaration_violations(node["Variant"]["Value"], args)
+        yield from _command_violations(node["Variant"]["Value"], args)
     if kind == "CallExpr":
         yield from _call_violations(node)
 
@@ -520,12 +596,14 @@ def _pins_read(content: str, filename: str, pins: Set[str]) -> set[str]:
     """Collect allow-listed reads or raise one error with all refusals."""
     reads: set[str] = set()
     refusals: list[str] = []
-    for node, kind, chain, allowed, inert in _walk_script(_parse_script(content, filename)):
+    source = content.encode("utf-8")
+    for node, kind, chain, allowed, inert in _walk_script(_parse_script(source, filename)):
         route = " > ".join(f"{parent}.{field}" for parent, field in chain)
-        for group, construct in _ast_violations(node, kind):
-            line = node["Pos"]["Line"]
+        for group, construct in _ast_violations(node, kind, source):
+            location = node["Args"][0] if kind == "CallExpr" else node
+            line = location["Pos"]["Line"]
             refusals.append(f"{filename}:{line}: [{group}] {construct} at {route}: {_CONSTRUCT_REFUSALS[group]}")
-        if kind == "ParamExp" and allowed and _supported_parameter(node):
+        if kind == "ParamExp" and allowed and _supported_parameter(node, source):
             if (name := node["Param"]["Value"]) in pins:
                 reads.add(name)
         elif not inert:
@@ -540,7 +618,7 @@ def _pins_read(content: str, filename: str, pins: Set[str]) -> set[str]:
 
 @cache
 def _provisioner_reads(path: Path, pins: frozenset[str]) -> set[str]:
-    return _pins_read(path.read_text(encoding="utf-8"), path.name, pins)
+    return _pins_read(path.read_bytes().decode("utf-8"), path.name, pins)
 
 
 def _all_provisioner_reads() -> set[str]:
@@ -759,10 +837,17 @@ class TestVersionPinsConsumed:
             pytest.param('echo "${#arr[@]}"', "", id="all-members-length"),
             pytest.param('for x in "${arr[@]}"; do :; done', "", id="all-members-loop"),
             pytest.param('echo "${PIN[@]}"', "read", id="pin-array"),
+            pytest.param('echo "${PIN[*]}"', "read", id="pin-array-star"),
+            pytest.param('echo "π${PIN[@]}"', "read", id="pin-array-utf8-offset"),
+            pytest.param('echo "${PIN[ @]}"', "arithmetic ParamExp.Index", id="index-leading-space"),
+            pytest.param('echo "${PIN[@ ]}"', "arithmetic ParamExp.Index", id="index-trailing-space"),
+            pytest.param('echo "${PIN[ * ]}"', "arithmetic ParamExp.Index", id="index-padded-star"),
+            pytest.param('echo "${#PIN[ @]}"', "arithmetic ParamExp.Index", id="length-index-leading-space"),
             pytest.param('echo "${arr[0]}"', "arithmetic ParamExp.Index", id="index-digit"),
             pytest.param('echo "${arr[PIN]}"', "arithmetic ParamExp.Index", id="index-name"),
             pytest.param('echo "${arr[$PIN]}"', "arithmetic ParamExp.Index", id="index-expansion"),
             pytest.param('echo "${arr["@"]}"', "arithmetic ParamExp.Index", id="index-quoted-at"),
+            pytest.param(r'echo "${PIN[\@]}"', "arithmetic ParamExp.Index", id="index-escaped-at"),
             pytest.param('echo "${arr[1+1]}"', "arithmetic ParamExp.Index", id="index-arithmetic"),
             pytest.param('echo "${arr[@]:PIN}"', "arithmetic ParamExp.Slice", id="slice-name"),
             pytest.param('echo "${arr[@]:1:2}"', "arithmetic ParamExp.Slice", id="slice-literal"),
@@ -779,6 +864,51 @@ class TestVersionPinsConsumed:
             _pins_read(content, "array.sh", {"PIN"})
         constructs = re.findall(r"^array\.sh:\d+: \[(\w+)\] (\S+) at File\.Stmts", str(error.value), re.MULTILINE)
         assert constructs == [tuple(expected.split())]
+
+    @pytest.mark.parametrize(
+        ("content", "group"),
+        [
+            pytest.param('cmd=eval; "$cmd" \'echo "$PI\\\nN"\'', "dynamic command", id="expanded-command"),
+            pytest.param('cmd=eval; builtin "$cmd" \'echo "$PI\\\nN"\'', "dynamic command", id="builtin-command"),
+            pytest.param('"$(printf %s eval)" \'echo "$PI\\\nN"\'', "dynamic command", id="substituted-command"),
+            pytest.param('opts=-uc; /usr/bin/bash "$opts" \'echo "$PI\\\nN"\'', "dynamic option", id="shell-options"),
+            pytest.param(
+                'cb() { echo "$PIN"; }; opt=C; mapfile -c1 -t"$opt" cb <<<line', "dynamic option", id="mapfile-cluster"
+            ),
+            pytest.param('op=-v; p=P; test "$op" "${p}IN"', "dynamic option", id="test-operator"),
+            pytest.param('op=-v; p=P; [ "$op" "${p}IN" ]', "dynamic option", id="bracket-operator"),
+            pytest.param('op==; test x "$op" y', "dynamic option", id="binary-operator"),
+            pytest.param('op==; test ! x "$op" y', "dynamic option", id="negated-binary-operator"),
+            pytest.param('op=-n; test "(" "$op" x ")"', "dynamic option", id="parenthesized-unary-operator"),
+            pytest.param('test x -a y -o "$x"', "dynamic option", id="long-test"),
+            pytest.param('flag=-p; command "$flag" -- true', "dynamic option", id="prefix-option"),
+            pytest.param('flag=-p; declare "$flag" x', "dynamic option", id="declaration-option"),
+            pytest.param('sh "$script"', "dynamic option", id="shell-first-argument"),
+            pytest.param('eval "echo ready"', "eval", id="literal-eval"),
+            pytest.param("eval 'echo \"$PI\\\nN\"'", "eval", id="continued-eval"),
+            pytest.param("[[ x == @(P'IN') ]]", "extglob", id="quoted-extglob"),
+            pytest.param(r"[[ x == @(P\IN) ]]", "extglob", id="escaped-extglob"),
+            pytest.param("[[ x == @(PIN) ]]", "extglob", id="bare-extglob"),
+            pytest.param('[ "$#" -ne 2 ]', "", id="bracket-argument-count"),
+            pytest.param('[ "${#expected}" -eq 64 ]', "", id="bracket-length"),
+            pytest.param('[ -f "$x" ]', "", id="bracket-file"),
+            pytest.param('[ -n "$x" ]', "", id="bracket-nonempty"),
+            pytest.param('test "$x"', "", id="one-test-operand"),
+            pytest.param('test ! -n "$x"', "", id="negated-unary-test"),
+            pytest.param('test "(" -n "$x" ")"', "", id="parenthesized-unary-test"),
+            pytest.param('test ! "$x" = "$y"', "", id="negated-binary-test"),
+            pytest.param('read -d "$delim" -- target', "", id="literal-option-with-dynamic-value"),
+            pytest.param('sh -- "$script"', "", id="options-ended"),
+            pytest.param('printf "%s" "$opt"', "", id="operand-after-format"),
+            pytest.param("run() { :; }; run; /usr/bin/true", "", id="literal-function-and-path"),
+        ],
+    )
+    def test_pin_reader_round_nine(self, content: str, group: str) -> None:
+        if not group:
+            assert _pins_read(content, "round-nine.sh", {"PIN"}) == set()
+            return
+        with pytest.raises(PinRefusal, match=rf"(?m)^round-nine\.sh:\d+: \[{group}\] .+ at File\.Stmts"):
+            _pins_read(content, "round-nine.sh", {"PIN"})
 
     def test_pin_reader_redirect_scope(self) -> None:
         contents = (
@@ -798,6 +928,12 @@ class TestVersionPinsConsumed:
                 "literal-dollar-delimiter.sh",
                 "1:7: expansions not allowed in heredoc words",
                 id="literal-dollar-delimiter",
+            ),
+            pytest.param(
+                '[[ x "$op" y ]]',
+                "dynamic-double-bracket.sh",
+                r"1:6: not a valid test operator",
+                id="dynamic-double-bracket",
             ),
         ],
     )
