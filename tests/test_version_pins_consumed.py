@@ -10,8 +10,9 @@ A read is an allow-listed expansion Bash performs whenever its statement
 executes. Statement selection (branches, command-level &&, function calls)
 is out of scope. Expression-level conditions (including || and && inside
 [[ ]] or arithmetic, and the word of another expansion) are refused.
+Statements execute only if all redirections succeed; a redirection failure is out-of-scope statement selection.
 Provisioners must stay shfmt-parseable. Scripts shfmt cannot parse fail
-closed by filename and parser diagnostic.
+closed by filename and parser diagnostic (see expanded-target and literal-dollar-delimiter).
 """
 
 import json
@@ -22,7 +23,7 @@ from collections.abc import Iterator, Set
 from datetime import date
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -51,6 +52,59 @@ type Edge = tuple[str, str]
 type Node = dict[str, Any]
 type Visit = tuple[Node, tuple[Edge, ...], bool, bool]
 
+
+class DynamicWord(NamedTuple):
+    prefix: str
+
+
+type Argument = str | DynamicWord
+type Violation = tuple[str, str]
+
+_ANSI_ESCAPE = re.compile(
+    r"""\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|c(?:\\\\|[^\\\n])|[abefnrtvE\\'"?])"""
+)
+_ANSI_LETTERS = dict(zip("abefnrtvE", "\a\b\x1b\f\n\r\t\v\x1b", strict=True))
+_UNQUOTED_ESCAPE = re.compile(r"\\([\s\S])")
+_QUOTED_ESCAPE = re.compile(r"""\\([$"\x60\\\n])""")
+_WORD_EXPANSION = re.compile(r"""\\[\s\S]|[*?~]|\[[^]]+\]|\{[^{}]*(?:,|\.\.)[^{}]*\}""")
+_ASSIGNMENT_START = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=")
+
+_CONSTRUCT_REFUSALS = {
+    "arithmetic": "arithmetic can recursively evaluate variable names",
+    "indirect": "indirection can resolve a variable name at runtime",
+    "dynamic name": "the variable name must be one plain literal name",
+    "dynamic code": "the code word must be fully literal",
+}
+_DECLARATIONS = {"declare", "local", "typeset", "readonly", "export"}
+_REFERENCE_DECLARATIONS = {"declare", "local", "typeset"}
+_ARITHMETIC_TESTS = {"-eq", "-ne", "-lt", "-le", "-gt", "-ge"}
+_NAME_TESTS = {"-v", "-R"}
+_MAPFILE_OPTIONS = set("dnOsuCc")
+_NAME_COMMANDS = {"[", "test", "printf", "getopts", "read", "mapfile", "readarray", "unset", "printenv"}
+_CODE_COMMANDS = {"eval", "trap", ".", "source", "bash", "sh", "mapfile", "readarray"}
+_PREFIX_OPTIONS = {
+    "sudo": set("aCcDghpRrtTu")
+    | {
+        "auth-type",
+        "chdir",
+        "close-from",
+        "group",
+        "host",
+        "prompt",
+        "user",
+        "chroot",
+        "role",
+        "type",
+        "command-timeout",
+    },
+    "env": {"a", "C", "S", "u", "argv0", "chdir", "split-string", "unset", "env0-from"},
+    "exec": {"a"},
+    "command": set(),
+    "builtin": set(),
+    "nohup": set(),
+    "timeout": {"k", "s", "kill-after", "signal"},
+}
+
 # shfmt omits Type when the concrete child type is already known to its encoder.
 _UNTYPED_KINDS = {
     **dict.fromkeys(("Stmts", "Cond", "Then", "Do", "Body", "X", "Y"), "Stmt"),
@@ -58,6 +112,7 @@ _UNTYPED_KINDS = {
     "Assigns": "Assign",
     "Args": "Assign",  # CallExpr argument words have Parts.
     "Items": "CaseItem",  # WordIter item words have Parts.
+    "Elems": "ArrayElem",
     "Redirs": "Redirect",
     "Exp": "Expansion",
 }
@@ -182,38 +237,284 @@ def _supported_parameter(node: Node) -> bool:
     )
 
 
+def _escaped_character(match: re.Match[str]) -> str:
+    return match[1].removesuffix("\n")
+
+
+def _ansi_character(match: re.Match[str]) -> str:
+    escape = match[1]
+    if escape[0] in "xuU":
+        codepoint = int(escape[1:], 16)
+        return chr(codepoint) if codepoint <= 0x10FFFF else "\ufffd"
+    if escape[0] in "01234567":
+        return chr(int(escape, 8) % 256)
+    if escape[0] == "c":
+        return "\x7f" if escape[1] == "?" else chr(ord(escape[1]) & 31)
+    return _ANSI_LETTERS.get(escape, escape)
+
+
+def _literal_sections(part: Node, quoted: bool, heredoc: bool) -> Iterator[tuple[str, int]]:
+    value = part.get("Value", "")
+    line = part.get("ValuePos", part["Pos"])["Line"]
+    for raw in re.findall(r"[^\n]*\n|[^\n]+$", value):
+        if part.get("Dollar"):
+            decoded, nul, _ = _ANSI_ESCAPE.sub(_ansi_character, raw).partition("\0")
+            yield decoded, line
+            if nul:
+                break
+        elif part["Type"] == "Lit" and not heredoc:
+            escapes = _QUOTED_ESCAPE if quoted else _UNQUOTED_ESCAPE
+            yield escapes.sub(_escaped_character, raw), line
+        else:
+            yield raw, line
+        line += 1
+
+
+def _word_sections(word: Node, *, static: bool = False, heredoc: bool = False) -> Iterator[tuple[str | None, int]]:
+    for part in word.get("Parts", ()):
+        kind = part["Type"]
+        if kind == "DblQuoted" and not (static and part.get("Dollar")):
+            for quoted in part.get("Parts", ()):
+                if quoted["Type"] == "Lit":
+                    yield from _literal_sections(quoted, quoted=True, heredoc=heredoc)
+                else:
+                    yield None, quoted["Pos"]["Line"]
+        elif kind in {"SglQuoted", "Lit"}:
+            if static and kind == "Lit":
+                expansion = next(
+                    (match for match in _WORD_EXPANSION.finditer(part.get("Value", "")) if match[0][0] != "\\"), None
+                )
+                if expansion:
+                    yield from _literal_sections({**part, "Value": part["Value"][: expansion.start()]}, False, False)
+                    yield None, part["Pos"]["Line"]
+                    continue
+            yield from _literal_sections(part, quoted=False, heredoc=heredoc)
+        else:
+            yield None, part["Pos"]["Line"]
+
+
+def _literal_runs(word: Node, *, heredoc: bool = False) -> Iterator[tuple[str, list[int]]]:
+    fragments: list[str] = []
+    lines: list[int] = []
+    for value, line in _word_sections(word, heredoc=heredoc):
+        if value is None:
+            yield "".join(fragments), lines
+            fragments, lines = [], []
+        else:
+            fragments.append(value)
+            lines.extend([line] * len(value))
+    yield "".join(fragments), lines
+
+
+def _command_word(word: Node) -> Argument:
+    fragments: list[str] = []
+    for value, _ in _word_sections(word, static=True):
+        if value is None:
+            return DynamicWord("".join(fragments))
+        fragments.append(value)
+    return "".join(fragments)
+
+
+def _option_fields(word: str) -> Iterator[tuple[str, str | None]]:
+    if word.startswith("--"):
+        flag, equals, value = word[2:].partition("=")
+        yield flag, value if equals else None
+    else:
+        for position, character in enumerate(word[1:], start=1):
+            key = "+" + character if word.startswith("+") else character
+            yield key, word[position + 1 :] or None
+
+
+def _take_options(args: list[Argument], takes_value: Set[str]) -> tuple[dict[str, Argument | None], list[Argument]]:
+    options: dict[str, Argument | None] = {}
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        dynamic = isinstance(argument, DynamicWord)
+        word = argument.prefix if dynamic else argument
+        if (
+            not word
+            or word in {"-", "+"}
+            or word[0] not in "-+"
+            or (dynamic and word.startswith("--") and "=" not in word)
+        ):
+            break
+        index += 1
+        if word == "--":
+            break
+        for flag, attached in _option_fields(word):
+            if flag not in takes_value:
+                options[flag] = None
+                continue
+            value: Argument | None = DynamicWord(attached or "") if dynamic else attached
+            if value is None and index < len(args):
+                value = args[index]
+                index += 1
+            options[flag] = value
+            break
+    return options, args[index:]
+
+
+def _invoked_command(words: list[Node]) -> tuple[str, list[Node]]:
+    while words:
+        name = _command_word(words[0])
+        command = name.rsplit("/", 1)[-1] if isinstance(name, str) else ""
+        words = words[1:]
+        if command not in _PREFIX_OPTIONS:
+            return command, words
+        values = [_command_word(word) for word in words]
+        options, remaining = _take_options(values, _PREFIX_OPTIONS[command])
+        if command == "command" and options.keys() & {"v", "V"}:
+            break
+        skipped = len(words) - len(remaining)
+        if command in {"env", "sudo"}:
+            for value in remaining:
+                if (command == "env" and value == "-") or _assignment_name(value):
+                    skipped += 1
+                else:
+                    break
+        words = words[skipped + (command == "timeout") :]
+    return "", []
+
+
+def _plain_name(value: Argument | None) -> bool:
+    return isinstance(value, str) and _PIN_NAME.fullmatch(value) is not None
+
+
+def _assignment_name(operand: Argument) -> str | None:
+    literal = operand.prefix if isinstance(operand, DynamicWord) else operand
+    assignment = _ASSIGNMENT_START.match(literal)
+    return assignment[1] if assignment else None
+
+
+def _declaration_violations(command: str, args: list[Argument]) -> Iterator[Violation]:
+    flags, names = _take_options(args, set())
+    if "i" in flags:
+        yield "arithmetic", f"{command} -i"
+    if "n" in flags and command in _REFERENCE_DECLARATIONS:
+        yield "indirect", f"{command} -n"
+    if any(not _plain_name(_assignment_name(operand) or operand) for operand in names):
+        yield "dynamic name", f"{command} -p" if "p" in flags else command
+
+
+def _name_operands(command: str, args: list[Argument]) -> Iterator[Argument | None]:
+    if command in {"[", "test"}:
+        operands = args[:-1] if command == "[" and args[-1:] == ["]"] else args
+        for operator, operand in zip(operands, operands[1:], strict=False):
+            if operator in _NAME_TESTS:
+                yield operand
+    elif command == "printf":
+        flags, operands = _take_options(args, {"v"})
+        if "v" in flags:
+            yield flags["v"]
+        elif operands and isinstance(operands[0], DynamicWord) and not operands[0].prefix:
+            yield operands[0]
+    elif command == "getopts":
+        _, operands = _take_options(args, set())
+        yield from operands[1:2]
+    elif command in {"read", "mapfile", "readarray", "unset", "printenv"}:
+        value_options = {"read": set("adinNptu"), "mapfile": _MAPFILE_OPTIONS, "readarray": _MAPFILE_OPTIONS}
+        flags, operands = _take_options(args, value_options.get(command, set()))
+        if command == "read" and "a" in flags:
+            yield flags["a"]
+        yield from operands
+
+
+def _code_operands(command: str, args: list[Argument]) -> list[Argument | None]:
+    if command == "eval":
+        return args
+    if command == "trap":
+        flags, operands = _take_options(args, set())
+        return operands[:1] if not flags.keys() & {"l", "P", "p"} else []
+    if command in {".", "source"}:
+        flags, operands = _take_options(args, {"p"})
+        return ([flags["p"]] if "p" in flags else []) + operands[:1]
+    if command in {"bash", "sh"}:
+        flags, operands = _take_options(args, {"O", "o", "init-file", "rcfile"})
+        return operands[:1] if "c" in flags else []
+    if command in {"mapfile", "readarray"}:
+        flags, _ = _take_options(args, _MAPFILE_OPTIONS)
+        return [flags["C"]] if "C" in flags else []
+    return []
+
+
+def _call_violations(node: Node) -> Iterator[Violation]:
+    command, words = _invoked_command(node.get("Args", []))
+    if command == "let":
+        yield "arithmetic", "let"
+    if command in _DECLARATIONS | _NAME_COMMANDS | _CODE_COMMANDS:
+        args = [_command_word(word) for word in words]
+        if command in _DECLARATIONS:
+            yield from _declaration_violations(command, args)
+        if any(not _plain_name(name) for name in _name_operands(command, args)):
+            yield "dynamic name", command
+        if any(not isinstance(code, str) for code in _code_operands(command, args)):
+            yield "dynamic code", f"{command} -c" if command in {"bash", "sh"} else command
+
+
+def _ast_violations(node: Node, kind: str) -> Iterator[Violation]:
+    if kind in {"ArithmCmd", "ArithmExp", "LetClause", "CStyleLoop"}:
+        yield "arithmetic", kind
+    if kind == "BinaryTest" and node["Op"] in _ARITHMETIC_TESTS:
+        yield "arithmetic", f"[[ {node['Op']} ]]"
+    if kind in {"ParamExp", "Assign", "ArrayElem"}:
+        for field in ("Index", "Slice"):
+            if field in node:
+                yield "arithmetic", f"{kind}.{field}"
+    if kind == "ParamExp" and node.get("Excl"):
+        yield "indirect", "ParamExp.Excl"
+    if kind == "UnaryTest" and node["Op"] in _NAME_TESTS and not _plain_name(_command_word(node["X"])):
+        yield "dynamic name", f"[[ {node['Op']} ]]"
+    if kind == "DeclClause":
+        args = [arg["Name"]["Value"] if "Name" in arg else _command_word(arg["Value"]) for arg in node.get("Args", ())]
+        yield from _declaration_violations(node["Variant"]["Value"], args)
+    if kind == "CallExpr":
+        yield from _call_violations(node)
+
+
+def _pin_mentions(node: Node, kind: str, chain: tuple[Edge, ...], pins: Set[str]) -> Iterator[tuple[str, int, str]]:
+    if kind == "ParamExp" and (name := node["Param"]["Value"]) in pins:
+        modifiers = sorted(node.keys() - _PARAMETER_METADATA - {"Dollar"})
+        operator = node.get("Exp", {}).get("Op")
+        shape = f"parameter expansion ({', '.join(modifiers) or 'plain'})"
+        if operator is not None:
+            shape += f" with operator {operator!r}"
+        yield name, node["Pos"]["Line"], shape
+    if kind == "Word":
+        for value, lines in _literal_runs(node, heredoc=chain[-1] == ("Redirect", "Hdoc")):
+            for match in _PIN_NAME.finditer(value):
+                if match[0] in pins:
+                    yield match[0], lines[match.start()], "literal word"
+    # Bare Lit fields include assignment, loop and function names, declaration variants, redirect descriptors and extglob patterns.
+    if kind == "Lit" and chain[-1][0] not in {"Word", "DblQuoted"}:
+        value = node.get("Value", "")
+        line = node.get("ValuePos", node["Pos"])["Line"]
+        for match in _PIN_NAME.finditer(value):
+            if match[0] in pins:
+                yield match[0], line + value.count("\n", 0, match.start()), "literal"
+
+
 class PinRefusal(ValueError):
-    """A script mentions pins outside the supported read forms."""
+    """A script uses an unsupported construct or mentions pins outside supported read forms."""
 
 
 def _pins_read(content: str, filename: str, pins: Set[str]) -> set[str]:
-    """Collect allow-listed reads or raise one error with every unsupported pin mention."""
+    """Collect allow-listed reads or raise one error with all refusals."""
     reads: set[str] = set()
     refusals: list[str] = []
     for node, kind, chain, allowed, inert in _walk_script(_parse_script(content, filename)):
-        if kind == "ParamExp" and (name := node["Param"]["Value"]) in pins:
-            if allowed and _supported_parameter(node):
+        route = " > ".join(f"{parent}.{field}" for parent, field in chain)
+        for group, construct in _ast_violations(node, kind):
+            line = node["Pos"]["Line"]
+            refusals.append(f"{filename}:{line}: [{group}] {construct} at {route}: {_CONSTRUCT_REFUSALS[group]}")
+        if kind == "ParamExp" and allowed and _supported_parameter(node):
+            if (name := node["Param"]["Value"]) in pins:
                 reads.add(name)
-                continue
-            modifiers = sorted(node.keys() - _PARAMETER_METADATA - {"Dollar"})
-            operator = node.get("Exp", {}).get("Op")
-            shape = f"parameter expansion ({', '.join(modifiers) or 'plain'})"
-            if operator is not None:
-                shape += f" with operator {operator!r}"
-            mentions = [(name, node["Pos"]["Line"], shape)]
-        elif kind in {"Lit", "SglQuoted"} and not inert:
-            value = node.get("Value", "")
-            start_line = node.get("ValuePos", node["Pos"])["Line"]
-            mentions = [
-                (match[0], start_line + value.count("\n", 0, match.start()), "literal")
-                for match in _PIN_NAME.finditer(value)
-                if match[0] in pins
-            ]
-        else:
-            continue
-        if mentions:
-            route = " > ".join(f"{parent}.{field}" for parent, field in chain)
-            refusals.extend(f"{filename}:{line}: {name}: {shape} at {route}" for name, line, shape in mentions)
+        elif not inert:
+            refusals.extend(
+                f"{filename}:{line}: {name}: {shape} at {route}"
+                for name, line, shape in _pin_mentions(node, kind, chain, pins)
+            )
     if refusals:
         raise PinRefusal("\n".join(refusals))
     return reads
@@ -261,9 +562,9 @@ class TestVersionPinsConsumed:
         with pytest.raises(PinRefusal) as error:
             _pins_read(multiline, "multiline.sh", pins | {"QUOTED_HEREDOC_PIN", "SINGLE_QUOTED_PIN", "ESCAPED_PIN"})
         assert str(error.value).splitlines() == [
-            "multiline.sh:10: QUOTED_HEREDOC_PIN: literal at File.Stmts > Stmt.Redirs > Redirect.Hdoc > Word.Parts",
-            "multiline.sh:12: SINGLE_QUOTED_PIN: literal at File.Stmts > Stmt.Cmd > CallExpr.Args > Word.Parts",
-            "multiline.sh:12: ESCAPED_PIN: literal at File.Stmts > Stmt.Cmd > CallExpr.Args > Word.Parts > DblQuoted.Parts",
+            "multiline.sh:10: QUOTED_HEREDOC_PIN: literal word at File.Stmts > Stmt.Redirs > Redirect.Hdoc",
+            "multiline.sh:12: SINGLE_QUOTED_PIN: literal word at File.Stmts > Stmt.Cmd > CallExpr.Args",
+            "multiline.sh:12: ESCAPED_PIN: literal word at File.Stmts > Stmt.Cmd > CallExpr.Args",
         ]
 
     @pytest.mark.parametrize(
@@ -352,6 +653,93 @@ class TestVersionPinsConsumed:
             assert sorted(reported) == sorted(refused.split())
         else:
             assert _pins_read(content, "detection.sh", pins) == expected
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            pytest.param("declare n=P'IN'", "literal word", id="declaration-value"),
+            pytest.param("echo P'IN'", "literal word", id="single-quoted-part"),
+            pytest.param("echo P''IN", "literal word", id="empty-quoted-part"),
+            pytest.param('echo "P"IN', "literal word", id="double-quoted-part"),
+            pytest.param(r"echo P\IN", "literal word", id="unquoted-escape"),
+            pytest.param(r"echo $'P\x49N'", "literal word", id="ansi-hex"),
+            pytest.param(r"echo $'P\111N'", "literal word", id="ansi-octal"),
+            pytest.param(r"echo $'P\u0049N'", "literal word", id="ansi-unicode"),
+            pytest.param(r"echo $'P\U00000049N'", "literal word", id="ansi-long-unicode"),
+            pytest.param(r"echo $'\cAPIN'", "literal word", id="ansi-control-boundary"),
+            pytest.param(r"echo $'\tPIN'", "literal word", id="ansi-letter-boundary"),
+            pytest.param(r"echo $'P\x00ignored'IN", "literal word", id="ansi-nul"),
+            pytest.param(r'echo "P\IN"', "", id="double-quoted-literal-backslash"),
+            pytest.param('echo P"$E"IN', "", id="expansion-between-literal-runs"),
+            pytest.param("X=P'IN'", "literal word", id="assignment-value"),
+            pytest.param("cat <<P'IN'\nbody\nPIN\n", "literal word", id="here-delimiter"),
+            pytest.param("[[ x == P'IN' ]]", "literal word", id="test-operand"),
+            pytest.param("declare -i n=P'IN'", "arithmetic", id="integer-declaration"),
+            pytest.param("let P'IN'", "arithmetic", id="let-split"),
+            pytest.param("NAME=P'IN'; printf '%s' \"${!NAME}\"", "indirect", id="split-indirect-name"),
+            pytest.param("declare -n alias=P'IN'", "indirect", id="split-nameref"),
+            pytest.param("n=$(printf P)IN; (( n ))", "arithmetic", id="recursive-arithmetic"),
+            pytest.param('printenv "$(printf P)IN"', "dynamic name", id="printenv"),
+            pytest.param("[[ -v $NAME ]]", "dynamic name", id="variable-test"),
+            pytest.param('printf -v "$NAME" x', "dynamic name", id="printf-name"),
+            pytest.param('read -r "$NAME"', "dynamic name", id="read-name"),
+            pytest.param(r'eval "echo \$$NAME"', "dynamic code", id="eval"),
+            pytest.param('trap "$CODE" EXIT', "dynamic code", id="trap"),
+            pytest.param('sudo bash -c "$CODE"', "dynamic code", id="sudo-shell"),
+            pytest.param('. "$FILE"', "dynamic code", id="dot-source"),
+            pytest.param("[[ 1 -eq 1 ]]", "arithmetic", id="arithmetic-test-without-pin"),
+            pytest.param('echo "$((1))"', "arithmetic", id="arithmetic-expansion-without-pin"),
+            pytest.param("for ((n=0; n<1; n++)); do :; done", "arithmetic", id="arithmetic-loop-without-pin"),
+            pytest.param('arr=(x); echo "${arr[0]}"', "arithmetic", id="parameter-index-without-pin"),
+            pytest.param('value=abc; echo "${value:1}"', "arithmetic", id="parameter-slice-without-pin"),
+            pytest.param("arr[0]=x", "arithmetic", id="assignment-index-without-pin"),
+            pytest.param('arr=(x); echo "${!arr[@]}"', "indirect", id="indirect-index-list"),
+            pytest.param('echo "${!N*}" "${!N@}"', "indirect", id="indirect-prefix-list"),
+            pytest.param('declare -p "$NAME"', "dynamic name", id="declare-query"),
+            pytest.param('export "${NAME}=x"', "dynamic name", id="export-name"),
+            pytest.param('readonly "$NAME"', "dynamic name", id="readonly-name"),
+            pytest.param('test -v "$NAME"', "dynamic name", id="test-name"),
+            pytest.param('[ -v "$NAME" ]', "dynamic name", id="bracket-name"),
+            pytest.param('printf -v"$NAME" x', "dynamic name", id="printf-attached-name"),
+            pytest.param('read -a"$NAME"', "dynamic name", id="read-array-option"),
+            pytest.param('mapfile -t "$NAME"', "dynamic name", id="mapfile-name"),
+            pytest.param('readarray "$NAME"', "dynamic name", id="readarray-name"),
+            pytest.param('getopts a "$NAME" -a', "dynamic name", id="getopts-name"),
+            pytest.param('unset -v "$NAME"', "dynamic name", id="unset-name"),
+            pytest.param('mapfile -C"$CODE" -c1', "dynamic code", id="mapfile-callback"),
+            pytest.param('command -- eval "$CODE"', "dynamic code", id="command-eval"),
+            pytest.param('builtin source -- "$FILE"', "dynamic code", id="builtin-source"),
+            pytest.param(
+                'env MARK="$VALUE" nohup timeout -k 1 1 /usr/bin/bash -uc "$CODE"', "dynamic code", id="nested-wrappers"
+            ),
+            pytest.param('exec -a runner /usr/bin/bash -uc "$CODE"', "dynamic code", id="exec-shell"),
+            pytest.param('timeout 1 sh -uc "$CODE"', "dynamic code", id="timeout-shell"),
+            pytest.param("""trap 'echo $PIN' EXIT""", "literal word", id="literal-trap-pin"),
+            pytest.param('[ "$#" -ne 2 ]', "", id="bracket-numeric-test"),
+            pytest.param('export HF_HOME="/var/lib/models/huggingface"', "", id="export-assignment"),
+            pytest.param("""trap 'rm -rf "${tmpdir}"' EXIT""", "", id="literal-trap"),
+            pytest.param("local tmpdir", "", id="literal-local"),
+            pytest.param(". /lib/dracut-lib.sh", "", id="literal-source"),
+            pytest.param('exec /sbin/x "$@"', "", id="ordinary-exec"),
+            pytest.param('echo "$PIN"', "read", id="ordinary-read"),
+        ],
+    )
+    def test_pin_reader_round_eight(self, content: str, expected: str) -> None:
+        if expected in {"", "read"}:
+            assert _pins_read(content, "round-eight.sh", {"PIN"}) == ({"PIN"} if expected == "read" else set())
+            return
+        with pytest.raises(PinRefusal) as error:
+            _pins_read(content, "round-eight.sh", {"PIN"})
+        detail = "PIN: literal word" if expected == "literal word" else rf"\[{expected}\] .+"
+        assert re.search(rf"^round-eight\.sh:\d+: {detail} at File\.Stmts", str(error.value), re.MULTILINE)
+
+    def test_pin_reader_redirect_scope(self) -> None:
+        contents = (
+            ': >/dev/null <<<"$PIN"',
+            # The docstring puts failed redirections under statement selection.
+            ': >/dev/null/not-a-directory <<<"$PIN"',
+        )
+        assert tuple(_pins_read(content, "redirect.sh", {"PIN"}) for content in contents) == ({"PIN"}, {"PIN"})
 
     @pytest.mark.parametrize(
         ("content", "filename", "diagnostic"),

@@ -6,8 +6,7 @@
 set -euo pipefail
 
 DRIVER_BRANCH="${NVIDIA_MAINSTREAM_DRIVER:?NVIDIA_MAINSTREAM_DRIVER must come from versions.json}"
-# CUDA label of the driver branch; tools/ci/upstream_sources.py checks that its cuda-compat
-# package depends on this branch. No CUDA toolkit is installed.
+# tools/ci/upstream_sources.py checks that cuda-compat for this CUDA label depends on the driver branch. No CUDA toolkit is installed.
 CUDA_VER="${CUDA_MAINSTREAM:?CUDA_MAINSTREAM must come from versions.json}"
 
 setup_nvidia_repositories() {
