@@ -84,7 +84,7 @@ jobs:
           FLAVOR: ${{ matrix.flavor }}
         run: python3 -I tools/ci/boot_smoke.py --image packer/output-images/"${FLAVOR}"/*.qcow2 --accel tcg --timeout 1500
       - name: Install Syft
-        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
       - name: Generate SBOMs from the Image Root File System
         # Syft reads no qcow2 disk: pointed at the file it writes a valid, empty SBOM. The
         # image is attached read-only through qemu-nbd and its root file system mounted
