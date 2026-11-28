@@ -94,7 +94,7 @@ jobs:
         if: github.event_name == 'pull_request' && steps.filter.outputs.govulncheck != 'true'
         shell: bash
         run: echo "::notice title=Nothing to check::No path of filter govulncheck in .github/path-filters.yml changed."
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         if: github.event_name != 'pull_request' || steps.filter.outputs.govulncheck == 'true'
         with:
           go-version-file: go.mod
